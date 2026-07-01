@@ -72,4 +72,13 @@ password since it contains your key.
 - `list_recent_candidates` and `list_pipeline_candidates` both accept a
   `since` ISO 8601 timestamp — this is what you'll use for the hourly
   pipeline check.
+- Write actions (`create_job`, `change_job_status`, `add_candidate_to_pipeline`,
+  `change_pipeline_status`, `create_candidate_list`, `add_candidates_to_list`,
+  `publish_job_to_portal`) are preview-by-default — calling them without
+  `confirm: true` shows what would happen without touching CATS. They only
+  execute when called again with `confirm: true`.
+- `change_pipeline_status` and `publish_job_to_portal` use endpoint paths
+  inferred from CATS's consistent API conventions rather than a fully
+  confirmed example in their docs. If either errors on first live use, send
+  the error back and the path will be corrected.
 - Free Vercel tier is plenty for this traffic level.

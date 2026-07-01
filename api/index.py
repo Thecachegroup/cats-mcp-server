@@ -5,18 +5,21 @@ serverless function using Streamable HTTP transport.
 Endpoint: POST /api/mcp/<CONNECTOR_SHARED_KEY>
 CATS:     Authorization: Token <CATS_API_KEY>  (set as env var, never sent by client)
 
-Tools exposed:
-  list_jobs                 - list jobs, with readable status name resolved
-  get_job                   - get a single job, with readable status + company
-  get_company                - get a company (client) by id
-  list_job_statuses          - list all possible job statuses (id -> name)
-  list_pipeline_candidates   - candidates in a job's pipeline, with readable
-                                status name, rating, and date_modified
-  get_workflow_statuses      - list statuses for a pipeline workflow (id -> name)
-  get_candidate               - get a candidate profile by id
-  get_candidate_resume        - list a candidate's resume/attachment history
-  read_resume                - download + extract text from a specific attachment
-  list_recent_candidates      - candidates created/updated since a given time
+Read tools:
+  list_jobs, get_job, get_company, list_job_statuses,
+  list_pipeline_candidates, get_workflow_statuses,
+  get_candidate, get_candidate_resume, read_resume, list_recent_candidates,
+  get_candidate_tags, get_candidate_custom_fields, get_candidate_pipeline_history,
+  list_portals
+
+Write tools (preview-by-default, require confirm: true to execute):
+  create_job, change_job_status, add_candidate_to_pipeline,
+  change_pipeline_status, create_candidate_list, add_candidates_to_list,
+  publish_job_to_portal
+
+Two write endpoints (change_pipeline_status, publish_job_to_portal) are
+inferred from CATS's consistent API patterns rather than fully confirmed
+against live docs — flagged in their own descriptions/responses.
 """
 
 import os
@@ -50,6 +53,32 @@ async def cats_get(path: str, params: dict | None = None):
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         return resp.json()
+
+
+async def cats_post(path: str, body: dict | None = None):
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(f"{CATS_API_BASE}{path}", headers=cats_headers(), json=body or {})
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        location = resp.headers.get("location")
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        if location:
+            data["_created_location"] = location
+        return data
+
+
+async def cats_put(path: str, body: dict | None = None):
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.put(f"{CATS_API_BASE}{path}", headers=cats_headers(), json=body or {})
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        try:
+            return resp.json()
+        except Exception:
+            return {}
 
 
 async def cats_get_binary(path: str):
@@ -213,6 +242,342 @@ async def tool_list_recent_candidates(args: dict):
     return data
 
 
+# ---- New: candidate flags (tags, custom fields, cross-job history) -------
+
+async def tool_get_candidate_tags(args: dict):
+    candidate_id = args["candidate_id"]
+    return await cats_get(f"/candidates/{candidate_id}/tags", {"per_page": 100})
+
+
+async def tool_get_candidate_custom_fields(args: dict):
+    candidate_id = args["candidate_id"]
+    return await cats_get(f"/candidates/{candidate_id}/custom_fields", {"per_page": 100})
+
+
+async def tool_get_candidate_pipeline_history(args: dict):
+    candidate_id = args["candidate_id"]
+    per_page = args.get("per_page", 100)
+    page = args.get("page", 1)
+    data = await cats_get(f"/candidates/{candidate_id}/pipelines", {"per_page": per_page, "page": page})
+
+    items = data.get("_embedded", {}).get("pipelines", [])
+    workflow_ids = {item.get("workflow_id") for item in items if item.get("workflow_id")}
+    status_map = {}
+    for wf_id in workflow_ids:
+        try:
+            statuses = await cats_get(f"/pipelines/workflows/{wf_id}/statuses", {"per_page": 100})
+            for s in statuses.get("_embedded", {}).get("statuses", []):
+                status_map[s["id"]] = s.get("title") or s.get("name")
+        except HTTPException:
+            continue
+
+    job_ids = {item.get("job_id") for item in items if item.get("job_id")}
+    job_titles = {}
+    for jid in job_ids:
+        try:
+            job = await cats_get(f"/jobs/{jid}")
+            job_titles[jid] = job.get("title")
+        except HTTPException:
+            continue
+
+    for item in items:
+        item["status_name"] = status_map.get(item.get("status_id"), f"Unknown ({item.get('status_id')})")
+        item["job_title"] = job_titles.get(item.get("job_id"), f"Unknown job ({item.get('job_id')})")
+
+    data["_embedded"]["pipelines"] = items
+    return data
+
+
+async def tool_update_pipeline_rating_status(args: dict):
+    """Set rating and/or status on a single pipeline entry."""
+    pipeline_id = args["pipeline_id"]
+    rating = args.get("rating")
+    status_id = args.get("status_id")
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "update_pipeline_rating_status",
+            "pipeline_id": pipeline_id,
+            "would_set_rating_to": rating,
+            "would_set_status_id_to": status_id,
+            "note": "Nothing has changed yet. Call again with confirm: true to actually apply this in CATS.",
+        }
+
+    results = {}
+    if rating is not None:
+        results["rating_update"] = await cats_put(f"/pipelines/{pipeline_id}", {"rating": rating})
+    if status_id is not None:
+        results["status_update"] = await cats_post(f"/pipelines/{pipeline_id}/status", {"status_id": status_id})
+    return {"changed": True, "action": "update_pipeline_rating_status", "pipeline_id": pipeline_id, "results": results}
+
+
+async def tool_bulk_update_pipelines(args: dict):
+    """Set rating and/or status across multiple pipeline entries at once —
+    e.g. 'give all those good candidates Qualifying status and 3 stars'."""
+    pipeline_ids = args["pipeline_ids"]
+    rating = args.get("rating")
+    status_id = args.get("status_id")
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "bulk_update_pipelines",
+            "pipeline_ids": pipeline_ids,
+            "count": len(pipeline_ids),
+            "would_set_rating_to": rating,
+            "would_set_status_id_to": status_id,
+            "note": f"Nothing has changed yet. This would update {len(pipeline_ids)} pipeline entries. "
+                    "Call again with confirm: true to actually apply this in CATS.",
+        }
+
+    results = []
+    for pid in pipeline_ids:
+        entry = {"pipeline_id": pid}
+        try:
+            if rating is not None:
+                await cats_put(f"/pipelines/{pid}", {"rating": rating})
+            if status_id is not None:
+                await cats_post(f"/pipelines/{pid}/status", {"status_id": status_id})
+            entry["success"] = True
+        except HTTPException as e:
+            entry["success"] = False
+            entry["error"] = str(e.detail)
+        results.append(entry)
+
+    return {"changed": True, "action": "bulk_update_pipelines", "results": results}
+
+
+async def tool_update_job_notes(args: dict):
+    job_id = args["job_id"]
+    new_notes = args["notes"]
+
+    current = await cats_get(f"/jobs/{job_id}")
+    body = {
+        "title": current["title"],
+        "location": current.get("location", {}),
+        "company_id": current["company_id"],
+        "country_code": current.get("country_code"),
+        "department_id": current.get("department_id"),
+        "recruiter_id": current.get("recruiter_id"),
+        "owner_id": current.get("owner_id"),
+        "category_name": current.get("category_name"),
+        "is_hot": current.get("is_hot"),
+        "start_date": current.get("start_date"),
+        "salary": current.get("salary"),
+        "max_rate": current.get("max_rate"),
+        "duration": current.get("duration"),
+        "type": current.get("type"),
+        "openings": current.get("openings"),
+        "external_id": current.get("external_id"),
+        "description": current.get("description"),
+        "contact_id": current.get("contact_id"),
+        "notes": new_notes,
+    }
+    body = {k: v for k, v in body.items() if v is not None}
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "update_job_notes",
+            "job_id": job_id,
+            "current_notes": current.get("notes"),
+            "would_set_notes_to": new_notes,
+            "note": "Only the notes field will change — everything else on the job (title, description, status, etc.) is preserved as-is. Nothing has changed yet. Call again with confirm: true to actually apply this in CATS.",
+        }
+
+    await cats_put(f"/jobs/{job_id}", body)
+    return {"changed": True, "action": "update_job_notes", "job_id": job_id}
+
+
+async def tool_update_candidate_notes(args: dict):
+    candidate_id = args["candidate_id"]
+    new_notes = args["notes"]
+
+    current = await cats_get(f"/candidates/{candidate_id}")
+    body = {
+        "first_name": current["first_name"],
+        "middle_name": current.get("middle_name"),
+        "last_name": current["last_name"],
+        "title": current.get("title"),
+        "address": current.get("address", {}),
+        "country_code": current.get("country_code"),
+        "social_media_urls": current.get("social_media_urls", []),
+        "website": current.get("website"),
+        "best_time_to_call": current.get("best_time_to_call"),
+        "current_employer": current.get("current_employer"),
+        "date_available": current.get("date_available"),
+        "current_pay": current.get("current_pay"),
+        "desired_pay": current.get("desired_pay"),
+        "is_willing_to_relocate": current.get("is_willing_to_relocate"),
+        "key_skills": current.get("key_skills"),
+        "source": current.get("source"),
+        "owner_id": current.get("owner_id"),
+        "is_active": current.get("is_active"),
+        "is_hot": current.get("is_hot"),
+        "notes": new_notes,
+    }
+    body = {k: v for k, v in body.items() if v is not None}
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "update_candidate_notes",
+            "candidate_id": candidate_id,
+            "current_notes": current.get("notes"),
+            "would_set_notes_to": new_notes,
+            "note": "Only the notes field will change — everything else on the candidate record is preserved as-is. Nothing has changed yet. Call again with confirm: true to actually apply this in CATS.",
+        }
+
+    await cats_put(f"/candidates/{candidate_id}", body)
+    return {"changed": True, "action": "update_candidate_notes", "candidate_id": candidate_id}
+
+
+# ---- New: write actions — preview unless confirm=true --------------------
+
+async def tool_create_job(args: dict):
+    body = {
+        "title": args["title"],
+        "location": args.get("location", {}),
+        "company_id": args["company_id"],
+        "description": args.get("description", ""),
+        "notes": args.get("notes", ""),
+        "country_code": args.get("country_code", "AU"),
+        "salary": args.get("salary", ""),
+        "max_rate": args.get("max_rate", ""),
+        "duration": args.get("duration", ""),
+        "openings": args.get("openings", 1),
+        "recruiter_id": args.get("recruiter_id"),
+        "owner_id": args.get("owner_id"),
+        "contact_id": args.get("contact_id"),
+    }
+    body = {k: v for k, v in body.items() if v is not None}
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "create_job",
+            "would_create": body,
+            "note": "Nothing has been created yet. Call this again with confirm: true to actually create this job in CATS.",
+        }
+
+    result = await cats_post("/jobs", body)
+    return {"created": True, "action": "create_job", "result": result}
+
+
+async def tool_change_job_status(args: dict):
+    job_id = args["job_id"]
+    status_id = args["status_id"]
+
+    if not args.get("confirm"):
+        statuses = await cats_get("/jobs/statuses", {"per_page": 100})
+        status_map = {s["id"]: s.get("title") or s.get("name") for s in statuses.get("_embedded", {}).get("statuses", [])}
+        return {
+            "preview": True,
+            "action": "change_job_status",
+            "job_id": job_id,
+            "would_set_status_to": status_map.get(status_id, f"Unknown ({status_id})"),
+            "note": "Nothing has changed yet. Call this again with confirm: true to actually change the job status in CATS.",
+        }
+
+    result = await cats_post(f"/jobs/{job_id}/status", {"status_id": status_id})
+    return {"changed": True, "action": "change_job_status", "job_id": job_id, "result": result}
+
+
+async def tool_add_candidate_to_pipeline(args: dict):
+    candidate_id = args["candidate_id"]
+    job_id = args["job_id"]
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "add_candidate_to_pipeline",
+            "candidate_id": candidate_id,
+            "job_id": job_id,
+            "note": "Nothing has changed yet. Call this again with confirm: true to actually add this candidate to the job's pipeline in CATS.",
+        }
+
+    result = await cats_post("/pipelines", {"candidate_id": candidate_id, "job_id": job_id})
+    return {"created": True, "action": "add_candidate_to_pipeline", "result": result}
+
+
+async def tool_change_pipeline_status(args: dict):
+    pipeline_id = args["pipeline_id"]
+    status_id = args["status_id"]
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "change_pipeline_status",
+            "pipeline_id": pipeline_id,
+            "would_set_status_id_to": status_id,
+            "note": "This endpoint is inferred from CATS's consistent status-change pattern and hasn't been "
+                    "live-tested yet — if it fails, the exact endpoint may need a small fix. Nothing has changed "
+                    "yet either way. Call this again with confirm: true to actually attempt the change in CATS.",
+        }
+
+    result = await cats_post(f"/pipelines/{pipeline_id}/status", {"status_id": status_id})
+    return {"changed": True, "action": "change_pipeline_status", "pipeline_id": pipeline_id, "result": result}
+
+
+async def tool_create_candidate_list(args: dict):
+    name = args["name"]
+    notes = args.get("notes", "")
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "create_candidate_list",
+            "would_create": {"name": name, "notes": notes},
+            "note": "Nothing has been created yet. Call this again with confirm: true to actually create this list in CATS.",
+        }
+
+    result = await cats_post("/candidates/lists", {"name": name, "notes": notes})
+    return {"created": True, "action": "create_candidate_list", "result": result}
+
+
+async def tool_add_candidates_to_list(args: dict):
+    list_id = args["list_id"]
+    candidate_ids = args["candidate_ids"]
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "add_candidates_to_list",
+            "list_id": list_id,
+            "would_add_candidate_ids": candidate_ids,
+            "note": "Nothing has changed yet. Call this again with confirm: true to actually add these candidates to the list in CATS.",
+        }
+
+    items = [{"candidate_id": cid} for cid in candidate_ids]
+    result = await cats_post(f"/candidates/lists/{list_id}/items", {"items": items})
+    return {"added": True, "action": "add_candidates_to_list", "result": result}
+
+
+async def tool_list_portals(args: dict):
+    return await cats_get("/portals", {"per_page": 100})
+
+
+async def tool_publish_job_to_portal(args: dict):
+    portal_id = args["portal_id"]
+    job_id = args["job_id"]
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "publish_job_to_portal",
+            "portal_id": portal_id,
+            "job_id": job_id,
+            "note": "This endpoint is inferred from the CATS docs table of contents (exact request shape wasn't "
+                    "fully retrievable) and hasn't been live-tested — if it fails, check the response error and "
+                    "we'll adjust the path. Nothing has changed yet either way. Call this again with confirm: true "
+                    "to actually attempt publishing in CATS.",
+        }
+
+    result = await cats_post(f"/portals/{portal_id}/jobs/{job_id}/publish", {})
+    return {"published": True, "action": "publish_job_to_portal", "result": result}
+
+
 TOOLS = {
     "list_jobs": {
         "description": "List jobs in CATS, including a readable status_name for each (e.g. 'Open', 'Closed', 'On Hold').",
@@ -309,6 +674,198 @@ TOOLS = {
             },
         },
         "handler": tool_list_recent_candidates,
+    },
+    "get_candidate_tags": {
+        "description": "Get all tags attached to a candidate. Use this to check for flags like 'Never Employ' that are set up as tags in this CATS instance.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"candidate_id": {"type": "integer"}},
+            "required": ["candidate_id"],
+        },
+        "handler": tool_get_candidate_tags,
+    },
+    "get_candidate_custom_fields": {
+        "description": "Get all custom field values on a candidate (e.g. a 'Recruitment Status' or 'Never Employ' dropdown field). Use this to check for flags set up as custom fields rather than tags.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"candidate_id": {"type": "integer"}},
+            "required": ["candidate_id"],
+        },
+        "handler": tool_get_candidate_custom_fields,
+    },
+    "get_candidate_pipeline_history": {
+        "description": "Get a candidate's FULL pipeline history across every job they have ever been attached to (not just the current job), with readable status_name and job_title for each. Always check this before recommending a candidate — a 'Never Employ' or rejection status from a past role, even years ago, will show up here even if the candidate looks fresh on a new job's pipeline.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {"type": "integer"},
+                "per_page": {"type": "integer", "default": 100},
+                "page": {"type": "integer", "default": 1},
+            },
+            "required": ["candidate_id"],
+        },
+        "handler": tool_get_candidate_pipeline_history,
+    },
+    "create_job": {
+        "description": "Create a new job order in CATS. PREVIEW BY DEFAULT: call without confirm to see what would be created without making any change. Call again with confirm: true to actually create it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "company_id": {"type": "integer"},
+                "location": {"type": "object", "description": "{city, state, postal_code}"},
+                "description": {"type": "string"},
+                "notes": {"type": "string"},
+                "country_code": {"type": "string", "default": "AU"},
+                "salary": {"type": "string"},
+                "max_rate": {"type": "string"},
+                "duration": {"type": "string"},
+                "openings": {"type": "integer", "default": 1},
+                "recruiter_id": {"type": "integer"},
+                "owner_id": {"type": "integer"},
+                "contact_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["title", "company_id"],
+        },
+        "handler": tool_create_job,
+    },
+    "change_job_status": {
+        "description": "Change a job's status in CATS (e.g. to make it Active/published, or Closed). PREVIEW BY DEFAULT: call without confirm to see the readable status name before it's set. Call again with confirm: true to actually change it. Use list_job_statuses first to find the right status_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "integer"},
+                "status_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["job_id", "status_id"],
+        },
+        "handler": tool_change_job_status,
+    },
+    "add_candidate_to_pipeline": {
+        "description": "Add a candidate to a job's pipeline in CATS. PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually add them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {"type": "integer"},
+                "job_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["candidate_id", "job_id"],
+        },
+        "handler": tool_add_candidate_to_pipeline,
+    },
+    "change_pipeline_status": {
+        "description": "Move a candidate to a different pipeline stage/status in CATS (e.g. from 'Qualifying' to 'TCG Interview'). PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually change it. Use get_workflow_statuses first to find the right status_id. Endpoint is inferred from CATS's pattern and not yet live-tested — report back if it errors.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipeline_id": {"type": "integer"},
+                "status_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["pipeline_id", "status_id"],
+        },
+        "handler": tool_change_pipeline_status,
+    },
+    "create_candidate_list": {
+        "description": "Create a new candidate list in CATS (e.g. a shortlist). PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually create it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "notes": {"type": "string"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["name"],
+        },
+        "handler": tool_create_candidate_list,
+    },
+    "add_candidates_to_list": {
+        "description": "Add candidates to an existing CATS candidate list. PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually add them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "list_id": {"type": "integer"},
+                "candidate_ids": {"type": "array", "items": {"type": "integer"}},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["list_id", "candidate_ids"],
+        },
+        "handler": tool_add_candidates_to_list,
+    },
+    "list_portals": {
+        "description": "List job board portals connected to this CATS account, with their portal_id. Use this to find the right portal_id before publishing a job.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_list_portals,
+    },
+    "publish_job_to_portal": {
+        "description": "Publish a job to a specific job board portal so it goes live for external applicants. PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually publish. Use list_portals first to find the right portal_id. Endpoint is inferred from CATS's docs table of contents and not yet live-tested — report back if it errors.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "portal_id": {"type": "integer"},
+                "job_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["portal_id", "job_id"],
+        },
+        "handler": tool_publish_job_to_portal,
+    },
+    "update_pipeline_rating_status": {
+        "description": "Set the star rating and/or pipeline status on a single candidate's pipeline entry (e.g. set rating to 3 and status to 'Qualifying'). PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually apply. Use get_workflow_statuses first to find the right status_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipeline_id": {"type": "integer"},
+                "rating": {"type": "integer", "description": "Star rating, typically 0-5"},
+                "status_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["pipeline_id"],
+        },
+        "handler": tool_update_pipeline_rating_status,
+    },
+    "bulk_update_pipelines": {
+        "description": "Set the star rating and/or pipeline status across MULTIPLE candidates' pipeline entries at once — this is the tool for 'give all those good candidates Qualifying status and 3 stars'. PREVIEW BY DEFAULT: call without confirm first to see how many entries would change. Call again with confirm: true to actually apply. Use get_workflow_statuses first to find the right status_id for the target stage.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipeline_ids": {"type": "array", "items": {"type": "integer"}},
+                "rating": {"type": "integer", "description": "Star rating, typically 0-5"},
+                "status_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["pipeline_ids"],
+        },
+        "handler": tool_bulk_update_pipelines,
+    },
+    "update_job_notes": {
+        "description": "Update the internal notes field on a job in CATS, preserving everything else on the job unchanged (title, description, status, etc.). PREVIEW BY DEFAULT: call without confirm first to see current vs new notes. Call again with confirm: true to actually apply.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "integer"},
+                "notes": {"type": "string"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["job_id", "notes"],
+        },
+        "handler": tool_update_job_notes,
+    },
+    "update_candidate_notes": {
+        "description": "Update the internal notes field on a candidate in CATS, preserving everything else on the candidate record unchanged. PREVIEW BY DEFAULT: call without confirm first to see current vs new notes. Call again with confirm: true to actually apply.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {"type": "integer"},
+                "notes": {"type": "string"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["candidate_id", "notes"],
+        },
+        "handler": tool_update_candidate_notes,
     },
 }
 

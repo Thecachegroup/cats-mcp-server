@@ -42,25 +42,33 @@ Vercel Project → Settings → Environment Variables, add:
 Redeploy after adding these (Vercel → Deployments → ⋯ → Redeploy).
 
 ### 4. Get your URL
-Vercel gives you `https://cats-mcp-server.vercel.app`. The MCP endpoint is:
+Your Vercel URL is `https://cats-mcp-server-gta1p7pad-tcg-s-projects.vercel.app`.
+
+**Note:** claude.ai's "Add custom connector" dialog only supports OAuth — there's
+no field for a custom header. So the shared key goes in the URL path instead:
+
 ```
-https://cats-mcp-server.vercel.app/api/mcp
+https://cats-mcp-server-gta1p7pad-tcg-s-projects.vercel.app/api/mcp/<CONNECTOR_SHARED_KEY>
 ```
-Test it's alive: open that URL in a browser — you should see
-`{"status":"ok","server":"cats-connector",...}`.
+
+Test it's alive: open that full URL (with your real key on the end) in a
+browser — you should see `{"status":"ok","server":"cats-connector",...}`.
+A wrong or missing key returns a 401.
 
 ### 5. Add it in Claude
 Settings → Connectors → Add custom connector:
-- URL: `https://cats-mcp-server.vercel.app/api/mcp`
-- Header: `X-Connector-Key: <the CONNECTOR_SHARED_KEY you set in step 3>`
+- Name: `CATS Connector`
+- URL: `https://cats-mcp-server-gta1p7pad-tcg-s-projects.vercel.app/api/mcp/<CONNECTOR_SHARED_KEY>`
+- Leave Advanced settings (OAuth) blank
 
-Give the same URL + key to your team — each person adds it individually
-under their own Settings → Connectors.
+Give the same full URL (key included) to your team — each person adds it
+individually under their own Settings → Connectors. Treat this URL like a
+password since it contains your key.
 
 ## Notes
 
 - The CATS API key never leaves Vercel — Claude only ever sends the shared
-  connector key, not your CATS credentials.
+  connector key (embedded in the URL), not your CATS credentials.
 - `list_recent_candidates` and `list_pipeline_candidates` both accept a
   `since` ISO 8601 timestamp — this is what you'll use for the hourly
   pipeline check.

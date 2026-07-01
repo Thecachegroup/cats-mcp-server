@@ -210,12 +210,10 @@ def rpc_error(id_, code, message):
     return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}}
 
 
-@app.post("/api/mcp")
-async def mcp_endpoint(request: Request):
-    if CONNECTOR_SHARED_KEY:
-        provided = request.headers.get("x-connector-key", "")
-        if provided != CONNECTOR_SHARED_KEY:
-            raise HTTPException(status_code=401, detail="Invalid or missing connector key")
+@app.post("/api/mcp/{key}")
+async def mcp_endpoint(key: str, request: Request):
+    if CONNECTOR_SHARED_KEY and key != CONNECTOR_SHARED_KEY:
+        raise HTTPException(status_code=401, detail="Invalid connector key")
 
     body = await request.json()
     method = body.get("method")
@@ -255,6 +253,6 @@ async def mcp_endpoint(request: Request):
     return JSONResponse(rpc_error(id_, -32601, f"Unknown method: {method}"))
 
 
-@app.get("/api/mcp")
-async def health():
+@app.get("/api/mcp/{key}")
+async def health(key: str):
     return {"status": "ok", "server": "cats-connector", "time": datetime.now(timezone.utc).isoformat()}

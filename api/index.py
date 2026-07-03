@@ -10,16 +10,21 @@ Read tools:
   list_pipeline_candidates, get_workflow_statuses,
   get_candidate, get_candidate_resume, read_resume, list_recent_candidates,
   get_candidate_tags, get_candidate_custom_fields, get_candidate_pipeline_history,
-  list_portals
+  list_portals, search_candidates, search_pipelines_by_status,
+  search_candidates_deep, search_companies, search_contacts
 
 Write tools (preview-by-default, require confirm: true to execute):
   create_job, change_job_status, add_candidate_to_pipeline,
   change_pipeline_status, create_candidate_list, add_candidates_to_list,
-  publish_job_to_portal
+  publish_job_to_portal, update_pipeline_rating_status, bulk_update_pipelines,
+  update_job_notes, update_candidate_notes, add_candidate_tag
 
-Two write endpoints (change_pipeline_status, publish_job_to_portal) are
-inferred from CATS's consistent API patterns rather than fully confirmed
-against live docs — flagged in their own descriptions/responses.
+Endpoints inferred from CATS's consistent API patterns rather than fully
+confirmed against live docs — flagged in their own descriptions/responses:
+  change_pipeline_status, publish_job_to_portal, search_contacts,
+  add_candidate_tag (endpoint path inferred; built against the "Attach" /
+  additive pattern rather than "Replace" to avoid wiping existing tags —
+  see tool description).
 """
 
 import os
@@ -578,6 +583,256 @@ async def tool_publish_job_to_portal(args: dict):
     return {"published": True, "action": "publish_job_to_portal", "result": result}
 
 
+# ---- New: search / discovery primitives -----------------------------------
+
+async def tool_search_candidates(args: dict):
+    """Free-text candidate lookup — the primary unlock for name-based queries.
+    Uses CATS's Search endpoint (free-text, accepts Boolean strings per user
+    reports) rather than Filter (structured field matching). Search coverage
+    of resume full-text vs the CATS UI search bar is not confirmed — if a
+    known candidate doesn't surface, fall back to list_recent_candidates or
+    ask for their candidate_id directly."""
+    query = args["query"]
+    page = args.get("page", 1)
+    per_page = args.get("per_page", 25)
+    data = await cats_get("/candidates/search", {"query": query, "page": page, "per_page": per_page})
+    return data
+
+
+async def tool_search_pipelines_by_status(args: dict):
+    """Bulk pipeline query across ALL jobs — e.g. 'everyone with Qualifying
+    status in the last 6 months'. Uses CATS's Filter Pipelines endpoint
+    (structured filter/field/value), not a plain query-string filter."""
+    status_id = args.get("status_id")
+    status_name = args.get("status")
+    job_id = args.get("job_id")
+    since = args.get("since")
+    page = args.get("page", 1)
+    per_page = min(args.get("per_page", 100), 200)
+
+    if status_id is None and status_name:
+        # Resolve name -> id. Pipeline statuses are per-workflow, so if a
+        # job_id is given, resolve against that job's workflow; otherwise
+        # this can't disambiguate across multiple workflows and the caller
+        # should pass status_id directly.
+        if job_id:
+            job = await cats_get(f"/jobs/{job_id}")
+            wf_id = job.get("pipeline_workflow_id")
+            if wf_id:
+                statuses = await cats_get(f"/pipelines/workflows/{wf_id}/statuses", {"per_page": 100})
+                for s in statuses.get("_embedded", {}).get("statuses", []):
+                    if (s.get("title") or s.get("name", "")).lower() == status_name.lower():
+                        status_id = s["id"]
+                        break
+        if status_id is None:
+            return {
+                "error": f"Could not resolve status name '{status_name}' to a status_id without a job_id to "
+                         "identify the workflow. Pass job_id to scope the search, or pass status_id directly "
+                         "(use get_workflow_statuses to find it).",
+            }
+
+    filter_obj = {"filter": "eq", "field": "status_id", "value": status_id}
+    body = {"filter": filter_obj, "page": page, "per_page": per_page}
+    if job_id:
+        body["job_id"] = job_id
+
+    data = await cats_post("/pipelines/filter", body)
+    items = data.get("_embedded", {}).get("pipelines", [])
+
+    if since:
+        items = _since_filter(items, since)
+
+    job_ids = {item.get("job_id") for item in items if item.get("job_id")}
+    job_titles = {}
+    for jid in job_ids:
+        try:
+            job = await cats_get(f"/jobs/{jid}")
+            job_titles[jid] = job.get("title")
+        except HTTPException:
+            continue
+
+    candidate_ids = {item.get("candidate_id") for item in items if item.get("candidate_id")}
+    candidate_info = {}
+    for cid in candidate_ids:
+        try:
+            cand = await cats_get(f"/candidates/{cid}")
+            candidate_info[cid] = {
+                "name": f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip(),
+                "email": (cand.get("emails") or {}).get("primary"),
+                "mobile": (cand.get("phones") or {}).get("mobile"),
+            }
+        except HTTPException:
+            continue
+
+    rows = []
+    for item in items:
+        cid = item.get("candidate_id")
+        info = candidate_info.get(cid, {})
+        rows.append({
+            "candidate_id": cid,
+            "name": info.get("name"),
+            "email": info.get("email"),
+            "mobile": info.get("mobile"),
+            "job_id": item.get("job_id"),
+            "job_title": job_titles.get(item.get("job_id")),
+            "status_name": status_name or f"status_id {status_id}",
+            "date_modified": item.get("date_modified"),
+        })
+
+    truncated = len(rows) >= 200
+    return {
+        "count": len(rows),
+        "rows": rows,
+        "truncated": truncated,
+        "note": "Result capped at 200 rows — narrow with since or job_id, or ask for a CSV export instead." if truncated else None,
+    }
+
+
+async def tool_search_candidates_deep(args: dict):
+    """Full-text CV keyword search — for terms profile search misses
+    (canonical case: security clearances). Slow tool — always bound with
+    since or max_results. Includes built-in synonym handling for common
+    Australian security clearance terminology."""
+    keyword = args["keyword"]
+    since = args.get("since")
+    max_results = min(args.get("max_results", 50), 100)
+
+    SYNONYMS = {
+        "nv1": ["nv1", "nv-1", "negative vetting 1", "negative vetting level 1"],
+        "nv2": ["nv2", "nv-2", "negative vetting 2", "negative vetting level 2"],
+        "baseline": ["baseline", "baseline clearance", "baseline vetting"],
+        "pv": ["pv", "positive vetting"],
+    }
+    kw_lower = keyword.lower().strip()
+    variants = SYNONYMS.get(kw_lower, [kw_lower])
+    if kw_lower in SYNONYMS:
+        variants = variants + ["agsva"]  # broader clearance context marker
+
+    per_page = 50
+    page = 1
+    candidates_checked = 0
+    matches = []
+
+    while candidates_checked < max_results * 4 and len(matches) < max_results:
+        params = {"per_page": per_page, "page": page, "sort": "-date_modified"}
+        data = await cats_get("/candidates", params)
+        items = data.get("_embedded", {}).get("candidates", [])
+        if not items:
+            break
+        if since:
+            items = _since_filter(items, since)
+
+        for cand in items:
+            candidates_checked += 1
+            if candidates_checked > max_results * 4:
+                break
+            cid = cand["id"]
+            try:
+                attachments = await cats_get(f"/candidates/{cid}/attachments", {"per_page": 10})
+            except HTTPException:
+                continue
+            resumes = [a for a in attachments.get("_embedded", {}).get("attachments", []) if a.get("is_resume")]
+            if not resumes:
+                continue
+            latest = resumes[0]
+            try:
+                content, _ = await cats_get_binary(f"/attachments/{latest['id']}/download")
+                text = extract_text_from_bytes(content, latest.get("filename", ""))
+            except Exception:
+                continue
+
+            text_lower = text.lower()
+            hit_terms = [v for v in variants if v in text_lower]
+            if hit_terms:
+                idx = text_lower.find(hit_terms[0])
+                start = max(0, idx - 60)
+                end = min(len(text), idx + 60)
+                snippet = text[start:end].replace("\n", " ").strip()
+                matches.append({
+                    "candidate_id": cid,
+                    "name": f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip(),
+                    "email": (cand.get("emails") or {}).get("primary"),
+                    "mobile": (cand.get("phones") or {}).get("mobile"),
+                    "matched_terms": hit_terms,
+                    "snippet": snippet,
+                    "attachment_id": latest["id"],
+                })
+            if len(matches) >= max_results:
+                break
+
+        page += 1
+        if len(items) < per_page:
+            break
+
+    return {
+        "keyword": keyword,
+        "variants_matched_against": variants,
+        "candidates_scanned": candidates_checked,
+        "match_count": len(matches),
+        "matches": matches,
+        "note": "Snippets shown for verification — check context before acting (e.g. 'NV1 sought' vs 'holds active NV1' read very differently).",
+    }
+
+
+async def tool_search_companies(args: dict):
+    query = args["query"]
+    page = args.get("page", 1)
+    per_page = args.get("per_page", 25)
+    return await cats_get("/companies/search", {"query": query, "page": page, "per_page": per_page})
+
+
+async def tool_search_contacts(args: dict):
+    """Endpoint path inferred from CATS's consistent /search pattern used by
+    candidates and companies — not directly confirmed in docs. Report back
+    if this errors."""
+    query = args["query"]
+    page = args.get("page", 1)
+    per_page = args.get("per_page", 25)
+    return await cats_get("/contacts/search", {"query": query, "page": page, "per_page": per_page})
+
+
+async def tool_add_candidate_tag(args: dict):
+    """Adds (does not replace) tags on one or more candidates. Built against
+    CATS's additive 'Attach tags' pattern, not the destructive 'Replace tags'
+    pattern — this preserves any existing tags (including flags like 'Never
+    Employ') rather than overwriting them. Exact endpoint path is inferred
+    from the equivalent, confirmed job/company tag endpoints — report back
+    if this errors."""
+    candidate_ids = args.get("candidate_ids") or ([args["candidate_id"]] if args.get("candidate_id") else [])
+    tag = args["tag"]
+
+    if not candidate_ids:
+        return {"error": "Provide candidate_id or candidate_ids."}
+
+    if not args.get("confirm"):
+        names = []
+        for cid in candidate_ids:
+            try:
+                cand = await cats_get(f"/candidates/{cid}")
+                names.append(f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip())
+            except HTTPException:
+                names.append(f"(candidate {cid} — could not fetch name)")
+        return {
+            "preview": True,
+            "action": "add_candidate_tag",
+            "candidate_ids": candidate_ids,
+            "candidate_names": names,
+            "would_add_tag": tag,
+            "note": "This adds the tag without removing any existing tags. Nothing has changed yet. "
+                    "Call again with confirm: true to actually apply this in CATS.",
+        }
+
+    results = []
+    for cid in candidate_ids:
+        try:
+            result = await cats_post(f"/candidates/{cid}/tags", {"tags": [tag]})
+            results.append({"candidate_id": cid, "success": True, "result": result})
+        except HTTPException as e:
+            results.append({"candidate_id": cid, "success": False, "error": str(e.detail)})
+
+    return {"changed": True, "action": "add_candidate_tag", "tag": tag, "results": results}
+
+
 TOOLS = {
     "list_jobs": {
         "description": "List jobs in CATS, including a readable status_name for each (e.g. 'Open', 'Closed', 'On Hold').",
@@ -866,6 +1121,87 @@ TOOLS = {
             "required": ["candidate_id", "notes"],
         },
         "handler": tool_update_candidate_notes,
+    },
+    "search_candidates": {
+        "description": "Free-text candidate lookup by name or keyword — the primary way to find a candidate_id when you only have a name. Uses CATS's free-text Search (accepts Boolean strings, but coverage of resume full-text vs the CATS UI search bar is unconfirmed). E.g. 'get me Karen Crabb's mobile' -> search_candidates('Karen Crabb') -> get_candidate.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "page": {"type": "integer", "default": 1},
+                "per_page": {"type": "integer", "default": 25},
+            },
+            "required": ["query"],
+        },
+        "handler": tool_search_candidates,
+    },
+    "search_pipelines_by_status": {
+        "description": "Bulk query across ALL jobs for candidates at a given pipeline status — e.g. 'email addresses of everyone with Qualifying status in the last 6 months'. Pass job_id to scope to one job and resolve a status name automatically, or pass status_id directly (from get_workflow_statuses) to search across jobs/workflows. Returns name, email, mobile, job, and status per row, capped at 200 with a truncation note.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Readable status name, e.g. 'Qualifying'. Requires job_id to resolve unless status_id is given directly."},
+                "status_id": {"type": "integer", "description": "Use instead of status to search across multiple workflows/jobs directly."},
+                "job_id": {"type": "integer", "description": "Optional — scopes the search and lets 'status' be resolved by name."},
+                "since": {"type": "string", "description": "ISO 8601 timestamp to bound results."},
+                "page": {"type": "integer", "default": 1},
+                "per_page": {"type": "integer", "default": 100},
+            },
+        },
+        "handler": tool_search_pipelines_by_status,
+    },
+    "search_candidates_deep": {
+        "description": "Full-text CV keyword search for terms that profile/name search misses — canonical case: security clearances ('everyone who mentions NV1'). Built-in synonym handling for nv1/nv2/baseline/pv clearance variants. SLOW — always pass since to bound scope, or rely on the default max_results cap. Returns a matched snippet per hit so false positives ('NV1 sought' vs 'holds active NV1') are visible before acting.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string"},
+                "since": {"type": "string", "description": "ISO 8601 timestamp — strongly recommended to bound scope."},
+                "max_results": {"type": "integer", "default": 50},
+            },
+            "required": ["keyword"],
+        },
+        "handler": tool_search_candidates_deep,
+    },
+    "search_companies": {
+        "description": "Free-text search for client companies by name or keyword.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "page": {"type": "integer", "default": 1},
+                "per_page": {"type": "integer", "default": 25},
+            },
+            "required": ["query"],
+        },
+        "handler": tool_search_companies,
+    },
+    "search_contacts": {
+        "description": "Free-text search for contacts (people at client companies) by name or keyword. Endpoint path inferred from CATS's consistent /search pattern used by candidates and companies — not directly confirmed in docs, report back if this errors.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "page": {"type": "integer", "default": 1},
+                "per_page": {"type": "integer", "default": 25},
+            },
+            "required": ["query"],
+        },
+        "handler": tool_search_contacts,
+    },
+    "add_candidate_tag": {
+        "description": "Add a tag to one or more candidates (e.g. tag everyone found via search_candidates_deep with 'NV1' so future queries are instant tag lookups instead of CV re-scans). ADDITIVE — does not remove existing tags. PREVIEW BY DEFAULT: call without confirm first to see candidate names and the tag to be applied. Call again with confirm: true to actually apply. Endpoint path inferred from the equivalent confirmed job/company tag endpoints — report back if this errors.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {"type": "integer", "description": "For a single candidate — use candidate_ids for bulk."},
+                "candidate_ids": {"type": "array", "items": {"type": "integer"}, "description": "For bulk tagging."},
+                "tag": {"type": "string"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["tag"],
+        },
+        "handler": tool_add_candidate_tag,
     },
 }
 

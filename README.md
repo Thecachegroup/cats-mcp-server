@@ -74,11 +74,19 @@ password since it contains your key.
   pipeline check.
 - Write actions (`create_job`, `change_job_status`, `add_candidate_to_pipeline`,
   `change_pipeline_status`, `create_candidate_list`, `add_candidates_to_list`,
-  `publish_job_to_portal`) are preview-by-default — calling them without
+  `publish_job_to_portal`, `update_pipeline_rating_status`,
+  `bulk_update_pipelines`, `update_job_notes`, `update_candidate_notes`,
+  `add_candidate_tag`) are preview-by-default — calling them without
   `confirm: true` shows what would happen without touching CATS. They only
   execute when called again with `confirm: true`.
-- `change_pipeline_status` and `publish_job_to_portal` use endpoint paths
-  inferred from CATS's consistent API conventions rather than a fully
-  confirmed example in their docs. If either errors on first live use, send
-  the error back and the path will be corrected.
+- `add_candidate_tag` is additive — it adds a tag without removing existing
+  ones. This matters because CATS also has a destructive "replace tags"
+  mechanism; this connector deliberately avoids it so tagging a candidate
+  can never silently wipe an existing flag like "Never Employ".
+- `search_candidates_deep` is a slow tool (it downloads and parses CVs) —
+  always bound it with `since` or rely on the `max_results` cap.
+- Endpoints inferred from CATS's conventions rather than confirmed live:
+  `change_pipeline_status`, `publish_job_to_portal`, `search_contacts`,
+  `add_candidate_tag`. Each is flagged in its own tool description — report
+  back if any errors on first real use.
 - Free Vercel tier is plenty for this traffic level.

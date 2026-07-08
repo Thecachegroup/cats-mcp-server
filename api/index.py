@@ -736,9 +736,15 @@ async def tool_search_pipelines_by_status(args: dict):
     max_jobs = min(args.get("max_jobs", 50), 100)
 
     async def _resolve_status_id_for_job(jid):
-        job = await cats_get(f"/jobs/{jid}")
-        wf_id = job.get("pipeline_workflow_id")
-        if not wf_id or not status_name:
+        """Resolve a status NAME to its id for this job. The job object's
+        pipeline_workflow_id is unreliable (often null), so we read the
+        workflow_id from the job's actual pipeline entries instead."""
+        if not status_name:
+            return None
+        pls = await cats_get(f"/jobs/{jid}/pipelines", {"per_page": 1})
+        entries = pls.get("_embedded", {}).get("pipelines", [])
+        wf_id = entries[0].get("workflow_id") if entries else None
+        if not wf_id:
             return None
         statuses = await cats_get(f"/pipelines/workflows/{wf_id}/statuses", {"per_page": 100})
         for s in statuses.get("_embedded", {}).get("statuses", []):
@@ -823,7 +829,7 @@ async def tool_search_pipelines_by_status(args: dict):
             candidate_info[cid] = {
                 "name": f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip(),
                 "email": (cand.get("emails") or {}).get("primary"),
-                "mobile": (cand.get("phones") or {}).get("mobile"),
+                "mobile": (cand.get("phones") or {}).get("cell"),
             }
         except HTTPException:
             continue
@@ -914,7 +920,7 @@ async def tool_search_candidates_deep(args: dict):
                 "candidate_id": cid,
                 "name": f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip(),
                 "email": (cand.get("emails") or {}).get("primary"),
-                "mobile": (cand.get("phones") or {}).get("mobile"),
+                "mobile": (cand.get("phones") or {}).get("cell"),
                 "matched_terms": hit_terms,
                 "snippet": snippet,
                 "attachment_id": latest["id"],

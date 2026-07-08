@@ -5,6 +5,18 @@ serverless function using Streamable HTTP transport.
 Endpoint: POST /api/mcp/<CONNECTOR_SHARED_KEY>
 CATS:     Authorization: Token <CATS_API_KEY>  (set as env var, never sent by client)
 
+v2 (July 2026) changes:
+  - All responses auto-shaped: _embedded flattened to a top-level array,
+    _links stripped, pagination (total/per_page/pages/has_more) at top level.
+  - filter_jobs / filter_candidates: one-call filtered pulls (paging happens
+    inside the connector, not in Claude).
+  - Activities entity added (read + preview-gated write, candidates and contacts).
+  - Lists read side added (list_candidate_lists, get_list_items, remove_list_item).
+  - Candidate writes: create_candidate, update_candidate,
+    upload_candidate_attachment, remove_candidate_tag (single-tag only —
+    deliberately no bulk replace, so flags like 'Never Employ' can't be wiped).
+  - get_contact, get_job_applications.
+
 Read tools:
   list_jobs, get_job, get_company, list_job_statuses,
   list_pipeline_candidates, get_workflow_statuses,
@@ -92,6 +104,57 @@ async def cats_get_binary(path: str):
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
         return resp.content, resp.headers.get("content-type", "")
+
+
+
+async def cats_delete(path: str, body: dict | None = None):
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.request("DELETE", f"{CATS_API_BASE}{path}", headers=cats_headers(), json=body)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        try:
+            return resp.json()
+        except Exception:
+            return {"deleted": True}
+
+
+async def cats_post_multipart(path: str, filename: str, content: bytes, extra: dict | None = None):
+    headers = {"Authorization": f"Token {CATS_API_KEY}"}
+    files = {"file": (filename, content)}
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(f"{CATS_API_BASE}{path}", headers=headers, files=files, data=extra or {})
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
+        try:
+            return resp.json()
+        except Exception:
+            return {"uploaded": True}
+
+
+def auto_shape(result):
+    """v2: flatten HAL _embedded to a top-level array, strip _links, and
+    surface pagination (total/count/page/pages/has_more) at top level so
+    responses are directly usable without digging into nested structures.
+    Applied globally in the MCP endpoint."""
+    if not isinstance(result, dict):
+        return result
+    emb = result.get("_embedded")
+    if isinstance(emb, dict):
+        for key, val in emb.items():
+            if key not in result:
+                result[key] = val
+        result.pop("_embedded", None)
+    result.pop("_links", None)
+    total = result.get("total")
+    per_page = result.get("count") if isinstance(result.get("count"), int) else result.get("per_page")
+    page = result.get("page")
+    if isinstance(total, int) and isinstance(per_page, int) and per_page > 0:
+        pages = (total + per_page - 1) // per_page
+        result["per_page"] = per_page
+        result["pages"] = pages
+        if isinstance(page, int):
+            result["has_more"] = page < pages
+    return result
 
 
 def _since_filter(items: list, since: str):
@@ -833,7 +896,494 @@ async def tool_add_candidate_tag(args: dict):
     return {"changed": True, "action": "add_candidate_tag", "tag": tag, "results": results}
 
 
+
+# ============================ v2 additions ============================
+
+# ---- Server-side filtering (one call replaces multi-page pulls) ------
+
+_JOB_FILTER_FIELDS = {"date_created", "date_modified", "status_id", "company_id", "title"}
+_CAND_FILTER_FIELDS = {"date_created", "date_modified", "source", "city", "state"}
+
+
+def _apply_local_filters(items: list, filters: list) -> list:
+    out = []
+    for item in items:
+        ok = True
+        for f in filters:
+            field, op, value = f.get("field"), f.get("op", "eq"), f.get("value")
+            actual = item.get(field)
+            if op in (">=", "gte") and field.startswith("date"):
+                if not actual or str(actual)[:19] < str(value)[:19]:
+                    ok = False
+            elif op in ("<=", "lte") and field.startswith("date"):
+                if not actual or str(actual)[:19] > str(value)[:19]:
+                    ok = False
+            elif op == "contains":
+                if value is None or actual is None or str(value).lower() not in str(actual).lower():
+                    ok = False
+            else:  # eq
+                if str(actual) != str(value):
+                    ok = False
+            if not ok:
+                break
+        if ok:
+            out.append(item)
+    return out
+
+
+async def _paged_filter(entity: str, key: str, filters: list, max_pages: int = 10):
+    """Pull pages server-side (in Vercel, not in Claude) and filter locally.
+    One MCP call regardless of CATS page count."""
+    all_items = []
+    page = 1
+    pages_seen = 0
+    truncated = False
+    while True:
+        data = await cats_get(f"/{entity}", {"per_page": 100, "page": page})
+        items = data.get("_embedded", {}).get(key, [])
+        all_items.extend(items)
+        pages_seen += 1
+        total = data.get("total", 0)
+        if len(all_items) >= total or not items:
+            break
+        if pages_seen >= max_pages:
+            truncated = True
+            break
+        page += 1
+    matched = _apply_local_filters(all_items, filters)
+    return {
+        key: matched,
+        "total": len(matched),
+        "scanned": len(all_items),
+        "truncated": truncated,
+        "note": ("Scan capped at %d pages — results may be incomplete; narrow the filter." % max_pages) if truncated else None,
+    }
+
+
+async def tool_filter_jobs(args: dict):
+    """One-call filtered job pull. Filters run inside the connector (Vercel)
+    so Claude never pages through the full job list. Supported fields:
+    date_created, date_modified (ops: >=, <=), status_id, company_id (eq),
+    title (contains)."""
+    filters = args["filters"]
+    for f in filters:
+        if f.get("field") not in _JOB_FILTER_FIELDS:
+            raise HTTPException(status_code=422, detail=f"Unsupported job filter field: {f.get('field')}. Supported: {sorted(_JOB_FILTER_FIELDS)}")
+    result = await _paged_filter("jobs", "jobs", filters)
+    statuses = await cats_get("/jobs/statuses", {"per_page": 100})
+    status_map = {s["id"]: s.get("title") or s.get("name") for s in statuses.get("_embedded", {}).get("statuses", [])}
+    for job in result["jobs"]:
+        job["status_name"] = status_map.get(job.get("status_id"), f"Unknown ({job.get('status_id')})")
+    return result
+
+
+async def tool_filter_candidates(args: dict):
+    """One-call filtered candidate pull — same mechanics as filter_jobs.
+    Supported fields: date_created, date_modified (>=, <=), source, city,
+    state (eq/contains). Scan is capped at 10 pages (1000 newest candidates,
+    sorted by date_modified descending) — use date bounds to stay inside it."""
+    filters = args["filters"]
+    for f in filters:
+        if f.get("field") not in _CAND_FILTER_FIELDS:
+            raise HTTPException(status_code=422, detail=f"Unsupported candidate filter field: {f.get('field')}. Supported: {sorted(_CAND_FILTER_FIELDS)}")
+    all_items = []
+    page = 1
+    truncated = False
+    while page <= 10:
+        data = await cats_get("/candidates", {"per_page": 100, "page": page, "sort": "-date_modified"})
+        items = data.get("_embedded", {}).get("candidates", [])
+        all_items.extend(items)
+        if len(all_items) >= data.get("total", 0) or not items:
+            break
+        page += 1
+    else:
+        truncated = True
+    matched = _apply_local_filters(all_items, filters)
+    return {"candidates": matched, "total": len(matched), "scanned": len(all_items), "truncated": truncated}
+
+
+# ---- Activities (interaction history — calls, emails, meetings) ------
+
+async def tool_list_candidate_activities(args: dict):
+    """Full interaction history for a candidate — logged calls, emails,
+    meetings, notes, with dates and authors. Endpoint follows the confirmed
+    /candidates/{id}/attachments and /tags sub-resource pattern — inferred,
+    report back if it errors."""
+    candidate_id = args["candidate_id"]
+    per_page = args.get("per_page", 50)
+    page = args.get("page", 1)
+    return await cats_get(f"/candidates/{candidate_id}/activities", {"per_page": per_page, "page": page})
+
+
+async def tool_create_candidate_activity(args: dict):
+    """Log a call, email summary, meeting, or note against a candidate as a
+    proper timestamped activity (the durable alternative to overwriting the
+    single notes field). 'date' is when the activity occurred; CATS sets
+    date_created itself. Endpoint inferred — report back if it errors."""
+    candidate_id = args["candidate_id"]
+    activity_type = args.get("type", "note")
+    notes = args["notes"]
+    date = args.get("date")
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "create_candidate_activity",
+            "candidate_id": candidate_id,
+            "would_log": {"type": activity_type, "notes": notes, "date": date},
+            "note": "Nothing has changed yet. Call again with confirm: true to log this activity in CATS.",
+        }
+
+    body = {"type": activity_type, "notes": notes}
+    if date:
+        body["date"] = date
+    result = await cats_post(f"/candidates/{candidate_id}/activities", body)
+    return {"changed": True, "action": "create_candidate_activity", "candidate_id": candidate_id, "result": result}
+
+
+async def tool_list_contact_activities(args: dict):
+    """Interaction history for a contact (client-side: hiring manager calls,
+    briefs, feedback). Endpoint inferred from the candidate pattern —
+    report back if it errors."""
+    contact_id = args["contact_id"]
+    per_page = args.get("per_page", 50)
+    page = args.get("page", 1)
+    return await cats_get(f"/contacts/{contact_id}/activities", {"per_page": per_page, "page": page})
+
+
+async def tool_create_contact_activity(args: dict):
+    """Log a call, meeting, or note against a contact. Preview-by-default.
+    Endpoint inferred — report back if it errors."""
+    contact_id = args["contact_id"]
+    activity_type = args.get("type", "note")
+    notes = args["notes"]
+    date = args.get("date")
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "create_contact_activity",
+            "contact_id": contact_id,
+            "would_log": {"type": activity_type, "notes": notes, "date": date},
+            "note": "Nothing has changed yet. Call again with confirm: true to log this activity in CATS.",
+        }
+
+    body = {"type": activity_type, "notes": notes}
+    if date:
+        body["date"] = date
+    result = await cats_post(f"/contacts/{contact_id}/activities", body)
+    return {"changed": True, "action": "create_contact_activity", "contact_id": contact_id, "result": result}
+
+
+# ---- Lists: read side (previously write-only) -------------------------
+
+async def tool_list_candidate_lists(args: dict):
+    """List all candidate lists (hot lists) with their ids."""
+    per_page = args.get("per_page", 100)
+    page = args.get("page", 1)
+    return await cats_get("/candidates/lists", {"per_page": per_page, "page": page})
+
+
+async def tool_get_list_items(args: dict):
+    """Read back the candidates on a list — the missing half of the lists
+    workflow (create/add existed; contents were unreadable)."""
+    list_id = args["list_id"]
+    per_page = args.get("per_page", 100)
+    page = args.get("page", 1)
+    return await cats_get(f"/candidates/lists/{list_id}/items", {"per_page": per_page, "page": page})
+
+
+async def tool_remove_list_item(args: dict):
+    """Remove a candidate from a list (does not delete the candidate).
+    Preview-by-default. Endpoint inferred — report back if it errors."""
+    list_id = args["list_id"]
+    item_id = args["item_id"]
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "remove_list_item",
+            "list_id": list_id,
+            "item_id": item_id,
+            "note": "Nothing has changed yet. Call again with confirm: true to remove this item from the list.",
+        }
+    result = await cats_delete(f"/candidates/lists/{list_id}/items/{item_id}")
+    return {"changed": True, "action": "remove_list_item", "list_id": list_id, "item_id": item_id, "result": result}
+
+
+# ---- Candidate write operations ---------------------------------------
+
+async def tool_create_candidate(args: dict):
+    """Create a new candidate record (e.g. entering a sourced candidate from
+    LinkedIn). Preview-by-default. Duplicate check: run search_candidates on
+    the name/email first."""
+    fields = {k: v for k, v in args.items() if k != "confirm" and v is not None}
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "create_candidate",
+            "would_create": fields,
+            "note": "Nothing has changed yet. Check for duplicates with search_candidates first, then call again with confirm: true.",
+        }
+    result = await cats_post("/candidates", fields)
+    return {"changed": True, "action": "create_candidate", "result": result}
+
+
+async def tool_update_candidate(args: dict):
+    """Update fields on an existing candidate (phone, email, title, city
+    etc.) — general-purpose companion to update_candidate_notes. Preview-by-
+    default; only the fields you pass change."""
+    candidate_id = args["candidate_id"]
+    fields = {k: v for k, v in args.items() if k not in ("confirm", "candidate_id") and v is not None}
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "update_candidate",
+            "candidate_id": candidate_id,
+            "would_update": fields,
+            "note": "Nothing has changed yet. Call again with confirm: true to apply.",
+        }
+    result = await cats_put(f"/candidates/{candidate_id}", fields)
+    return {"changed": True, "action": "update_candidate", "candidate_id": candidate_id, "result": result}
+
+
+async def tool_upload_candidate_attachment(args: dict):
+    """Upload a file (formatted CV, submission cover page, interview pack)
+    onto a candidate record. Content is base64. Set is_resume true for CVs
+    so they appear in the resume history. Preview-by-default."""
+    import base64
+    candidate_id = args["candidate_id"]
+    filename = args["filename"]
+    is_resume = bool(args.get("is_resume", False))
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "upload_candidate_attachment",
+            "candidate_id": candidate_id,
+            "would_upload": {"filename": filename, "is_resume": is_resume,
+                             "size_bytes": len(base64.b64decode(args["content_base64"]))},
+            "note": "Nothing has changed yet. Call again with confirm: true to upload.",
+        }
+    content = base64.b64decode(args["content_base64"])
+    result = await cats_post_multipart(
+        f"/candidates/{candidate_id}/attachments", filename, content,
+        {"is_resume": "true" if is_resume else "false"},
+    )
+    return {"changed": True, "action": "upload_candidate_attachment", "candidate_id": candidate_id, "result": result}
+
+
+async def tool_remove_candidate_tag(args: dict):
+    """Remove a single named tag from a candidate — the safe undo for
+    add_candidate_tag (which is additive). Deliberately single-tag: there is
+    still no replace-all-tags tool, so flags like 'Never Employ' can never be
+    wiped in bulk. Preview-by-default. Endpoint inferred — report back if it
+    errors."""
+    candidate_id = args["candidate_id"]
+    tag_id = args["tag_id"]
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "remove_candidate_tag",
+            "candidate_id": candidate_id,
+            "tag_id": tag_id,
+            "note": "Nothing has changed yet. Get tag_id from get_candidate_tags. Call again with confirm: true to remove this one tag.",
+        }
+    result = await cats_delete(f"/candidates/{candidate_id}/tags/{tag_id}")
+    return {"changed": True, "action": "remove_candidate_tag", "candidate_id": candidate_id, "tag_id": tag_id, "result": result}
+
+
+# ---- Contacts & jobs: small read gaps ----------------------------------
+
+async def tool_get_contact(args: dict):
+    """Get a contact's full record by CATS contact id (search_contacts finds
+    them; this reads them)."""
+    contact_id = args["contact_id"]
+    return await cats_get(f"/contacts/{contact_id}")
+
+
+async def tool_get_job_applications(args: dict):
+    """Application records for a job — application-level data distinct from
+    pipeline entries. Endpoint inferred — report back if it errors."""
+    job_id = args["job_id"]
+    per_page = args.get("per_page", 100)
+    page = args.get("page", 1)
+    return await cats_get(f"/jobs/{job_id}/applications", {"per_page": per_page, "page": page})
+
+
 TOOLS = {
+    # ---- v2 additions ----
+    "filter_jobs": {
+        "description": "Filtered job pull in ONE call — the connector scans all job pages internally and returns only matches. Filters: [{field, op, value}]. Fields: date_created/date_modified (ops '>=', '<='), status_id/company_id (eq), title (contains). Use this instead of paging list_jobs for 'jobs since date X' questions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filters": {"type": "array", "items": {"type": "object", "properties": {
+                    "field": {"type": "string"}, "op": {"type": "string", "default": "eq"}, "value": {}}, "required": ["field", "value"]}},
+            },
+            "required": ["filters"],
+        },
+        "handler": tool_filter_jobs,
+    },
+    "filter_candidates": {
+        "description": "Filtered candidate pull in ONE call, scanning the 1000 most recently modified candidates internally. Filters: [{field, op, value}]. Fields: date_created/date_modified ('>=','<='), source/city/state (eq or contains). Use date bounds to stay inside the scan window.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filters": {"type": "array", "items": {"type": "object", "properties": {
+                    "field": {"type": "string"}, "op": {"type": "string", "default": "eq"}, "value": {}}, "required": ["field", "value"]}},
+            },
+            "required": ["filters"],
+        },
+        "handler": tool_filter_candidates,
+    },
+    "list_candidate_activities": {
+        "description": "Full interaction history for a candidate — logged calls, emails, meetings and notes with dates and authors. Read this before screening or contacting anyone: it is the relationship record. (Endpoint inferred — report back if it errors.)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"candidate_id": {"type": "integer"}, "per_page": {"type": "integer", "default": 50}, "page": {"type": "integer", "default": 1}},
+            "required": ["candidate_id"],
+        },
+        "handler": tool_list_candidate_activities,
+    },
+    "create_candidate_activity": {
+        "description": "Log a call, email summary, meeting or note against a candidate as a timestamped activity — use this instead of update_candidate_notes for interaction records. 'date' = when it occurred. Preview-by-default; requires confirm: true to execute.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {"type": "integer"},
+                "type": {"type": "string", "description": "call, email, meeting, note, other", "default": "note"},
+                "notes": {"type": "string"},
+                "date": {"type": "string", "description": "ISO 8601, when the activity occurred"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["candidate_id", "notes"],
+        },
+        "handler": tool_create_candidate_activity,
+    },
+    "list_contact_activities": {
+        "description": "Interaction history for a client contact — hiring manager calls, briefs, feedback. (Endpoint inferred — report back if it errors.)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"contact_id": {"type": "integer"}, "per_page": {"type": "integer", "default": 50}, "page": {"type": "integer", "default": 1}},
+            "required": ["contact_id"],
+        },
+        "handler": tool_list_contact_activities,
+    },
+    "create_contact_activity": {
+        "description": "Log a call, meeting or note against a client contact. Preview-by-default; requires confirm: true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "contact_id": {"type": "integer"},
+                "type": {"type": "string", "default": "note"},
+                "notes": {"type": "string"},
+                "date": {"type": "string"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["contact_id", "notes"],
+        },
+        "handler": tool_create_contact_activity,
+    },
+    "list_candidate_lists": {
+        "description": "List all candidate lists (hot lists) with their ids — pair with get_list_items to read contents.",
+        "inputSchema": {"type": "object", "properties": {"per_page": {"type": "integer", "default": 100}, "page": {"type": "integer", "default": 1}}},
+        "handler": tool_list_candidate_lists,
+    },
+    "get_list_items": {
+        "description": "Read back the candidates on a list — contents were previously write-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"list_id": {"type": "integer"}, "per_page": {"type": "integer", "default": 100}, "page": {"type": "integer", "default": 1}},
+            "required": ["list_id"],
+        },
+        "handler": tool_get_list_items,
+    },
+    "remove_list_item": {
+        "description": "Remove a candidate from a list (candidate record untouched). Preview-by-default; requires confirm: true. (Endpoint inferred.)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"list_id": {"type": "integer"}, "item_id": {"type": "integer"}, "confirm": {"type": "boolean", "default": False}},
+            "required": ["list_id", "item_id"],
+        },
+        "handler": tool_remove_list_item,
+    },
+    "create_candidate": {
+        "description": "Create a new candidate record (e.g. sourced from LinkedIn). Run search_candidates first to avoid duplicates. Preview-by-default; requires confirm: true. Common fields: first_name, last_name, emails, phones, title, city, state, source.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "first_name": {"type": "string"}, "last_name": {"type": "string"},
+                "title": {"type": "string"}, "city": {"type": "string"}, "state": {"type": "string"},
+                "source": {"type": "string"},
+                "emails": {"type": "object"}, "phones": {"type": "object"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["first_name", "last_name"],
+        },
+        "handler": tool_create_candidate,
+    },
+    "update_candidate": {
+        "description": "Update fields on an existing candidate (title, city, source etc.) — only the fields passed are changed. Preview-by-default; requires confirm: true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {"type": "integer"},
+                "first_name": {"type": "string"}, "last_name": {"type": "string"},
+                "title": {"type": "string"}, "city": {"type": "string"}, "state": {"type": "string"},
+                "source": {"type": "string"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["candidate_id"],
+        },
+        "handler": tool_update_candidate,
+    },
+    "upload_candidate_attachment": {
+        "description": "Upload a file (formatted CV, submission cover page, interview pack) onto a candidate record. content_base64 = base64 of the file; is_resume: true makes it appear in resume history. Preview-by-default; requires confirm: true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {"type": "integer"},
+                "filename": {"type": "string"},
+                "content_base64": {"type": "string"},
+                "is_resume": {"type": "boolean", "default": False},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["candidate_id", "filename", "content_base64"],
+        },
+        "handler": tool_upload_candidate_attachment,
+    },
+    "remove_candidate_tag": {
+        "description": "Remove ONE named tag from a candidate — the safe undo for add_candidate_tag. Get tag_id from get_candidate_tags. Deliberately single-tag; no bulk replace exists so protective flags can't be wiped. Preview-by-default; requires confirm: true. (Endpoint inferred.)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"candidate_id": {"type": "integer"}, "tag_id": {"type": "integer"}, "confirm": {"type": "boolean", "default": False}},
+            "required": ["candidate_id", "tag_id"],
+        },
+        "handler": tool_remove_candidate_tag,
+    },
+    "get_contact": {
+        "description": "Get a client contact's full record by CATS contact id (find the id with search_contacts).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"contact_id": {"type": "integer"}},
+            "required": ["contact_id"],
+        },
+        "handler": tool_get_contact,
+    },
+    "get_job_applications": {
+        "description": "Application records for a job — application-level data distinct from pipeline entries. (Endpoint inferred — report back if it errors.)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"job_id": {"type": "integer"}, "per_page": {"type": "integer", "default": 100}, "page": {"type": "integer", "default": 1}},
+            "required": ["job_id"],
+        },
+        "handler": tool_get_job_applications,
+    },
+
     "list_jobs": {
         "description": "List jobs in CATS, including a readable status_name for each (e.g. 'Open', 'Closed', 'On Hold').",
         "inputSchema": {
@@ -1230,7 +1780,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": "1.1.0"},
+            "serverInfo": {"name": "cats-connector", "version": "2.0.0"},
         }))
 
     if method == "tools/list":
@@ -1252,6 +1802,7 @@ async def mcp_endpoint(key: str, request: Request):
             return JSONResponse(rpc_error(id_, -32000, f"CATS API error: {e.detail}"))
         except KeyError as e:
             return JSONResponse(rpc_error(id_, -32602, f"Missing required argument: {e}"))
+        result = auto_shape(result)
         return JSONResponse(rpc_result(id_, {
             "content": [{"type": "text", "text": json.dumps(result)}]
         }))

@@ -6,7 +6,7 @@ Projects.
 
 ## What's in here
 
-- `api/index.py` — the MCP server (6 tools: list_jobs, get_job,
+- `api/index.py` — the MCP server (46 tools; core reads: list_jobs, get_job,
   list_pipeline_candidates, get_candidate, get_candidate_resume,
   list_recent_candidates). Vercel auto-detects this as the FastAPI
   entrypoint — no `vercel.json` or `pyproject.toml` needed.
@@ -90,3 +90,20 @@ password since it contains your key.
   `add_candidate_tag`. Each is flagged in its own tool description — report
   back if any errors on first real use.
 - Free Vercel tier is plenty for this traffic level.
+
+
+## v2 changes (July 2026)
+
+- **Shaped responses everywhere** — `_embedded` flattened to a top-level array, `_links` stripped, and `total` / `per_page` / `pages` / `has_more` surfaced at top level. No more digging job arrays out of nested HAL structures.
+- **`filter_jobs` / `filter_candidates`** — one-call filtered pulls. The connector pages through CATS internally (Vercel side) and returns only matches, so "jobs advertised since 2025-07-07" is a single tool call instead of a six-page pull. Job filters: date_created/date_modified (`>=`, `<=`), status_id, company_id, title (contains). Candidate scan is capped at the 1,000 most recently modified.
+- **Activities entity** — `list_candidate_activities`, `create_candidate_activity`, plus contact equivalents. Interaction history (calls, emails, meetings) is now readable, and calls are logged as timestamped activities instead of overwriting the notes field. Endpoints follow the confirmed sub-resource pattern but are inferred — report back on first live use.
+- **Lists read side** — `list_candidate_lists`, `get_list_items`, `remove_list_item`. Lists were previously write-only.
+- **Candidate writes** — `create_candidate`, `update_candidate`, `upload_candidate_attachment` (base64; `is_resume` flag), `remove_candidate_tag`. All preview-by-default like existing writes. Tag removal is deliberately single-tag; there is still no bulk tag replace, so protective flags can never be wiped.
+- **Small read gaps** — `get_contact`, `get_job_applications`.
+- Version string bumped to 2.0.0.
+
+### Redeploy
+Push to the existing repo; Vercel redeploys automatically. No new env vars, no requirements changes. Same connector URL — nothing to change in Claude.
+
+### First-live-use checklist (inferred endpoints)
+Run each once and report errors: `list_candidate_activities`, `create_candidate_activity` (preview then confirm on a test candidate), `remove_list_item`, `remove_candidate_tag`, `get_job_applications`.

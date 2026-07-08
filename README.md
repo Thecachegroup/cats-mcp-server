@@ -107,3 +107,18 @@ Push to the existing repo; Vercel redeploys automatically. No new env vars, no r
 
 ### First-live-use checklist (inferred endpoints)
 Run each once and report errors: `list_candidate_activities`, `create_candidate_activity` (preview then confirm on a test candidate), `remove_list_item`, `remove_candidate_tag`, `get_job_applications`.
+
+## v2.1.0 (July 2026) — candidate date-handling fixes
+
+Fixes a cluster of bugs found in live testing, all rooted in two causes: CATS returns the `/candidates` list **oldest-first** and ignores a sort parameter, and the internal date filter crashed on date-only `since` values.
+
+- **Newest-first candidate paging** — new internal helper reads candidates from the newest end of the list instead of trusting a (silently ignored) sort param. Fixes:
+  - `filter_candidates` — was returning empty for any recent-date filter (it was scanning 2013 records).
+  - `list_recent_candidates` — same bug; this powers the **hourly pipeline check**.
+  - `search_candidates_deep` — was only ever scanning the oldest ~200 candidates, so recent CVs were unreachable.
+- **Date parsing no longer crashes** — `since` now accepts date-only (`2026-07-08`), `Z`-suffixed, or full-offset timestamps, and naive values are treated as UTC so comparisons against CATS's tz-aware dates can't raise. Fixes the hard error on `search_candidates_deep`/`search_pipelines_by_status` when a `since` was supplied.
+- **Real error messages** — the MCP dispatch now catches all exceptions and returns the actual error type, message, and a short traceback instead of an opaque "Error occurred during tool execution". This is how to diagnose the remaining inferred endpoints.
+
+### Still to verify live after this deploy
+- `search_pipelines_by_status` — errored on both paths before; with real error reporting now on, re-run it and the response will say what CATS actually rejects (likely the `/pipelines/filter` body shape).
+- **Contacts** — `search_contacts` returns zero even for broad terms. Grab one real contact ID from the CATS UI (open a client contact; the ID is in the URL) and run `get_contact` with it — that single call will confirm whether contacts are barely populated or the endpoint path is wrong.

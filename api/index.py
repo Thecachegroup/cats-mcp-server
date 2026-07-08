@@ -157,20 +157,61 @@ def auto_shape(result):
     return result
 
 
+def _to_aware(value: str):
+    """Parse an ISO date or datetime into a tz-aware UTC datetime.
+    Accepts date-only ('2026-01-01'), 'Z' suffix, or full offset. Returns
+    None if unparseable. Naive inputs are assumed UTC so comparisons against
+    CATS's tz-aware timestamps never raise TypeError."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = datetime.strptime(str(value)[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _since_filter(items: list, since: str):
-    since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    since_dt = _to_aware(since)
+    if since_dt is None:
+        return items
     filtered = []
     for item in items:
-        updated = item.get("date_modified") or item.get("date_created")
-        if not updated:
-            continue
-        try:
-            updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-        except ValueError:
+        updated_dt = _to_aware(item.get("date_modified") or item.get("date_created"))
+        if updated_dt is None:
             continue
         if updated_dt >= since_dt:
             filtered.append(item)
     return filtered
+
+
+async def _fetch_candidates_newest_first(pages: int = 10, per_page: int = 100):
+    """Pull candidates newest-first. CATS's /candidates list returns
+    OLDEST-first and ignores a sort query param, so we read the LAST pages
+    and reverse them. total/pages come from page 1; we then walk backwards
+    from the final page. Returns a flat list, newest first."""
+    first = await cats_get("/candidates", {"per_page": per_page, "page": 1})
+    total = first.get("total", 0)
+    if total == 0:
+        return []
+    last_page = (total + per_page - 1) // per_page
+    collected = []
+    p = last_page
+    walked = 0
+    while p >= 1 and walked < pages:
+        data = await cats_get("/candidates", {"per_page": per_page, "page": p})
+        items = data.get("_embedded", {}).get("candidates", [])
+        collected.extend(reversed(items))  # reverse within page -> newest first
+        walked += 1
+        p -= 1
+    return collected
+
+
 
 
 def extract_text_from_bytes(content: bytes, filename: str) -> str:
@@ -299,7 +340,11 @@ async def tool_read_resume(args: dict):
 async def tool_list_recent_candidates(args: dict):
     per_page = args.get("per_page", 50)
     page = args.get("page", 1)
-    data = await cats_get("/candidates", {"per_page": per_page, "page": page, "sort": "-date_modified"})
+    _all = await _fetch_candidates_newest_first(pages=10, per_page=100)
+    if since:
+        _all = _since_filter(_all, since)
+    start = (page - 1) * per_page
+    data = {"_embedded": {"candidates": _all[start:start + per_page]}, "total": len(_all)}
 
     since = args.get("since")
     if since:
@@ -771,61 +816,49 @@ async def tool_search_candidates_deep(args: dict):
     if kw_lower in SYNONYMS:
         variants = variants + ["agsva"]  # broader clearance context marker
 
-    per_page = 50
-    page = 1
     candidates_checked = 0
     matches = []
 
-    while candidates_checked < max_results * 4 and len(matches) < max_results:
-        params = {"per_page": per_page, "page": page, "sort": "-date_modified"}
-        data = await cats_get("/candidates", params)
-        items = data.get("_embedded", {}).get("candidates", [])
-        if not items:
+    # Newest-first so recent CVs are actually reached (CATS lists oldest-first).
+    pool = await _fetch_candidates_newest_first(pages=10, per_page=100)
+    if since:
+        pool = _since_filter(pool, since)
+
+    for cand in pool:
+        if len(matches) >= max_results or candidates_checked >= max_results * 8:
             break
-        if since:
-            items = _since_filter(items, since)
+        candidates_checked += 1
+        cid = cand["id"]
+        try:
+            attachments = await cats_get(f"/candidates/{cid}/attachments", {"per_page": 10})
+        except HTTPException:
+            continue
+        resumes = [a for a in attachments.get("_embedded", {}).get("attachments", []) if a.get("is_resume")]
+        if not resumes:
+            continue
+        latest = resumes[0]
+        try:
+            content, _ = await cats_get_binary(f"/attachments/{latest['id']}/download")
+            text = extract_text_from_bytes(content, latest.get("filename", ""))
+        except Exception:
+            continue
 
-        for cand in items:
-            candidates_checked += 1
-            if candidates_checked > max_results * 4:
-                break
-            cid = cand["id"]
-            try:
-                attachments = await cats_get(f"/candidates/{cid}/attachments", {"per_page": 10})
-            except HTTPException:
-                continue
-            resumes = [a for a in attachments.get("_embedded", {}).get("attachments", []) if a.get("is_resume")]
-            if not resumes:
-                continue
-            latest = resumes[0]
-            try:
-                content, _ = await cats_get_binary(f"/attachments/{latest['id']}/download")
-                text = extract_text_from_bytes(content, latest.get("filename", ""))
-            except Exception:
-                continue
-
-            text_lower = text.lower()
-            hit_terms = [v for v in variants if v in text_lower]
-            if hit_terms:
-                idx = text_lower.find(hit_terms[0])
-                start = max(0, idx - 60)
-                end = min(len(text), idx + 60)
-                snippet = text[start:end].replace("\n", " ").strip()
-                matches.append({
-                    "candidate_id": cid,
-                    "name": f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip(),
-                    "email": (cand.get("emails") or {}).get("primary"),
-                    "mobile": (cand.get("phones") or {}).get("mobile"),
-                    "matched_terms": hit_terms,
-                    "snippet": snippet,
-                    "attachment_id": latest["id"],
-                })
-            if len(matches) >= max_results:
-                break
-
-        page += 1
-        if len(items) < per_page:
-            break
+        text_lower = text.lower()
+        hit_terms = [v for v in variants if v in text_lower]
+        if hit_terms:
+            idx = text_lower.find(hit_terms[0])
+            start = max(0, idx - 60)
+            end = min(len(text), idx + 60)
+            snippet = text[start:end].replace("\n", " ").strip()
+            matches.append({
+                "candidate_id": cid,
+                "name": f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip(),
+                "email": (cand.get("emails") or {}).get("primary"),
+                "mobile": (cand.get("phones") or {}).get("mobile"),
+                "matched_terms": hit_terms,
+                "snippet": snippet,
+                "attachment_id": latest["id"],
+            })
 
     return {
         "keyword": keyword,
@@ -986,20 +1019,12 @@ async def tool_filter_candidates(args: dict):
     for f in filters:
         if f.get("field") not in _CAND_FILTER_FIELDS:
             raise HTTPException(status_code=422, detail=f"Unsupported candidate filter field: {f.get('field')}. Supported: {sorted(_CAND_FILTER_FIELDS)}")
-    all_items = []
-    page = 1
-    truncated = False
-    while page <= 10:
-        data = await cats_get("/candidates", {"per_page": 100, "page": page, "sort": "-date_modified"})
-        items = data.get("_embedded", {}).get("candidates", [])
-        all_items.extend(items)
-        if len(all_items) >= data.get("total", 0) or not items:
-            break
-        page += 1
-    else:
-        truncated = True
+    all_items = await _fetch_candidates_newest_first(pages=10, per_page=100)
+    truncated = len(all_items) >= 1000
     matched = _apply_local_filters(all_items, filters)
-    return {"candidates": matched, "total": len(matched), "scanned": len(all_items), "truncated": truncated}
+    return {"candidates": matched, "total": len(matched), "scanned": len(all_items),
+            "truncated": truncated,
+            "note": ("Scanned the newest 1000 candidates; older records not checked — narrow with a date bound if needed." if truncated else None)}
 
 
 # ---- Activities (interaction history — calls, emails, meetings) ------
@@ -1762,8 +1787,11 @@ def rpc_result(id_, result):
     return {"jsonrpc": "2.0", "id": id_, "result": result}
 
 
-def rpc_error(id_, code, message):
-    return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}}
+def rpc_error(id_, code, message, data=None):
+    err = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message, **({"data": data} if data is not None else {})}}
 
 
 @app.post("/api/mcp/{key}")
@@ -1780,7 +1808,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": "2.0.0"},
+            "serverInfo": {"name": "cats-connector", "version": "2.1.0"},
         }))
 
     if method == "tools/list":
@@ -1802,6 +1830,11 @@ async def mcp_endpoint(key: str, request: Request):
             return JSONResponse(rpc_error(id_, -32000, f"CATS API error: {e.detail}"))
         except KeyError as e:
             return JSONResponse(rpc_error(id_, -32602, f"Missing required argument: {e}"))
+        except Exception as e:
+            import traceback
+            return JSONResponse(rpc_error(id_, -32001,
+                f"{tool_name} failed: {type(e).__name__}: {e}",
+                data={"trace": traceback.format_exc()[-1500:]}))
         result = auto_shape(result)
         return JSONResponse(rpc_result(id_, {
             "content": [{"type": "text", "text": json.dumps(result)}]

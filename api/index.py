@@ -52,6 +52,10 @@ CATS_API_BASE = "https://api.catsone.com/v3"
 CATS_API_KEY = os.environ.get("CATS_API_KEY", "")
 CONNECTOR_SHARED_KEY = os.environ.get("CONNECTOR_SHARED_KEY", "")
 
+# Reported by the MCP 'initialize' handshake. Derived from the Vercel build
+# commit so the version string can never drift from the deployed code.
+SERVER_VERSION = os.environ.get("VERCEL_GIT_COMMIT_SHA", "dev")[:7]
+
 app = FastAPI()
 
 
@@ -355,6 +359,7 @@ async def tool_list_recent_candidates(args: dict):
         data["filtered_since"] = since
 
     return data
+
 
 # ---- New: candidate flags (tags, custom fields, cross-job history) -------
 
@@ -709,49 +714,99 @@ async def tool_search_candidates(args: dict):
 
 
 async def tool_search_pipelines_by_status(args: dict):
-    """Bulk pipeline query across ALL jobs — e.g. 'everyone with Qualifying
-    status in the last 6 months'. Uses CATS's Filter Pipelines endpoint
-    (structured filter/field/value), not a plain query-string filter."""
+    """Bulk pipeline query for candidates at a given pipeline status.
+
+    CATS v3 has NO 'filter pipelines' endpoint (Pipelines is not one of the
+    five filterable entities), so this is built on the endpoints that DO
+    exist: pipelines are listed per-job (GET /jobs/{id}/pipelines) or per-
+    candidate. We therefore always work job-by-job and filter status locally.
+
+    - job_id given: list that one job's pipelines, filter to the target
+      status. status name is resolved against that job's own workflow.
+    - no job_id: iterate open jobs, pull each job's pipelines, filter each to
+      the target status_id. status_id is REQUIRED here (a status *name* is
+      per-workflow and can't be resolved without a job), and the scan is
+      capped to keep the call bounded — narrow with since where possible.
+    """
     status_id = args.get("status_id")
     status_name = args.get("status")
     job_id = args.get("job_id")
     since = args.get("since")
-    page = args.get("page", 1)
     per_page = min(args.get("per_page", 100), 200)
+    max_jobs = min(args.get("max_jobs", 50), 100)
 
-    if status_id is None and status_name:
-        # Resolve name -> id. Pipeline statuses are per-workflow, so if a
-        # job_id is given, resolve against that job's workflow; otherwise
-        # this can't disambiguate across multiple workflows and the caller
-        # should pass status_id directly.
-        if job_id:
-            job = await cats_get(f"/jobs/{job_id}")
-            wf_id = job.get("pipeline_workflow_id")
-            if wf_id:
-                statuses = await cats_get(f"/pipelines/workflows/{wf_id}/statuses", {"per_page": 100})
-                for s in statuses.get("_embedded", {}).get("statuses", []):
-                    if (s.get("title") or s.get("name", "")).lower() == status_name.lower():
-                        status_id = s["id"]
-                        break
+    async def _resolve_status_id_for_job(jid):
+        job = await cats_get(f"/jobs/{jid}")
+        wf_id = job.get("pipeline_workflow_id")
+        if not wf_id or not status_name:
+            return None
+        statuses = await cats_get(f"/pipelines/workflows/{wf_id}/statuses", {"per_page": 100})
+        for s in statuses.get("_embedded", {}).get("statuses", []):
+            if (s.get("title") or s.get("name", "")).lower() == status_name.lower():
+                return s["id"]
+        return None
+
+    async def _pull_job_pipelines(jid):
+        """All pipeline entries for one job, paged internally."""
+        out = []
+        page = 1
+        while True:
+            data = await cats_get(f"/jobs/{jid}/pipelines", {"per_page": per_page, "page": page})
+            items = data.get("_embedded", {}).get("pipelines", [])
+            out.extend(items)
+            total = data.get("total", 0)
+            if len(out) >= total or not items:
+                break
+            page += 1
+        return out
+
+    # Build the list of (job_id, target_status_id) pairs to scan.
+    scan = []
+    truncated_jobs = False
+
+    if job_id:
+        resolved = status_id
+        if resolved is None:
+            resolved = await _resolve_status_id_for_job(job_id)
+        if resolved is None:
+            return {
+                "error": f"Could not resolve status '{status_name}' to a status_id for job {job_id}. "
+                         "Pass status_id directly (use get_workflow_statuses on the job's workflow).",
+            }
+        scan.append((job_id, resolved))
+    else:
+        # Cross-job: needs an explicit status_id (names are per-workflow).
         if status_id is None:
             return {
-                "error": f"Could not resolve status name '{status_name}' to a status_id without a job_id to "
-                         "identify the workflow. Pass job_id to scope the search, or pass status_id directly "
-                         "(use get_workflow_statuses to find it).",
+                "error": "Cross-job search needs status_id (a status name is per-workflow and can't be "
+                         "resolved without a job_id). Either pass job_id to scope to one job, or pass "
+                         "status_id from get_workflow_statuses. Note: cross-job scanning assumes the same "
+                         "status_id across jobs sharing a workflow.",
             }
+        jobs_data = await cats_get("/jobs", {"per_page": 100, "page": 1})
+        jobs = jobs_data.get("_embedded", {}).get("jobs", [])
+        if len(jobs) > max_jobs:
+            jobs = jobs[:max_jobs]
+            truncated_jobs = True
+        for j in jobs:
+            scan.append((j["id"], status_id))
 
-    filter_obj = {"filter": "eq", "field": "status_id", "value": status_id}
-    body = {"filter": filter_obj, "page": page, "per_page": per_page}
-    if job_id:
-        body["job_id"] = job_id
-
-    data = await cats_post("/pipelines/filter", body)
-    items = data.get("_embedded", {}).get("pipelines", [])
+    # Pull and filter.
+    matched = []
+    for jid, target_status in scan:
+        try:
+            pipelines = await _pull_job_pipelines(jid)
+        except HTTPException:
+            continue
+        for p in pipelines:
+            if p.get("status_id") == target_status:
+                matched.append(p)
 
     if since:
-        items = _since_filter(items, since)
+        matched = _since_filter(matched, since)
 
-    job_ids = {item.get("job_id") for item in items if item.get("job_id")}
+    # Hydrate job titles and candidate contact details.
+    job_ids = {m.get("job_id") for m in matched if m.get("job_id")}
     job_titles = {}
     for jid in job_ids:
         try:
@@ -760,7 +815,7 @@ async def tool_search_pipelines_by_status(args: dict):
         except HTTPException:
             continue
 
-    candidate_ids = {item.get("candidate_id") for item in items if item.get("candidate_id")}
+    candidate_ids = {m.get("candidate_id") for m in matched if m.get("candidate_id")}
     candidate_info = {}
     for cid in candidate_ids:
         try:
@@ -774,26 +829,30 @@ async def tool_search_pipelines_by_status(args: dict):
             continue
 
     rows = []
-    for item in items:
-        cid = item.get("candidate_id")
+    for m in matched:
+        cid = m.get("candidate_id")
         info = candidate_info.get(cid, {})
         rows.append({
             "candidate_id": cid,
             "name": info.get("name"),
             "email": info.get("email"),
             "mobile": info.get("mobile"),
-            "job_id": item.get("job_id"),
-            "job_title": job_titles.get(item.get("job_id")),
+            "job_id": m.get("job_id"),
+            "job_title": job_titles.get(m.get("job_id")),
             "status_name": status_name or f"status_id {status_id}",
-            "date_modified": item.get("date_modified"),
+            "date_modified": m.get("date_modified"),
         })
 
-    truncated = len(rows) >= 200
+    note = None
+    if truncated_jobs:
+        note = (f"Scanned the first {max_jobs} jobs only — cross-job results may be incomplete. "
+                "Scope with job_id, or raise max_jobs.")
     return {
         "count": len(rows),
         "rows": rows,
-        "truncated": truncated,
-        "note": "Result capped at 200 rows — narrow with since or job_id, or ask for a CSV export instead." if truncated else None,
+        "jobs_scanned": len(scan),
+        "truncated": truncated_jobs,
+        "note": note,
     }
 
 
@@ -1712,15 +1771,15 @@ TOOLS = {
         "handler": tool_search_candidates,
     },
     "search_pipelines_by_status": {
-        "description": "Bulk query across ALL jobs for candidates at a given pipeline status — e.g. 'email addresses of everyone with Qualifying status in the last 6 months'. Pass job_id to scope to one job and resolve a status name automatically, or pass status_id directly (from get_workflow_statuses) to search across jobs/workflows. Returns name, email, mobile, job, and status per row, capped at 200 with a truncation note.",
+        "description": "Find candidates at a given pipeline status. Best used scoped to one job (pass job_id + a status name like 'Qualifying', resolved automatically against that job's workflow). Cross-job search (no job_id) requires status_id directly (from get_workflow_statuses) since status names are per-workflow, scans open jobs job-by-job, and is capped by max_jobs — narrow with since where possible. Returns name, email, mobile, job, and status per row. Built on CATS's per-job pipeline endpoints (there is no server-side pipeline filter in the CATS API).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "status": {"type": "string", "description": "Readable status name, e.g. 'Qualifying'. Requires job_id to resolve unless status_id is given directly."},
-                "status_id": {"type": "integer", "description": "Use instead of status to search across multiple workflows/jobs directly."},
-                "job_id": {"type": "integer", "description": "Optional — scopes the search and lets 'status' be resolved by name."},
-                "since": {"type": "string", "description": "ISO 8601 timestamp to bound results."},
-                "page": {"type": "integer", "default": 1},
+                "status": {"type": "string", "description": "Readable status name, e.g. 'Qualifying'. Requires job_id to resolve."},
+                "status_id": {"type": "integer", "description": "Pipeline status_id (from get_workflow_statuses). Required for cross-job search."},
+                "job_id": {"type": "integer", "description": "Scope to one job — strongly preferred; lets 'status' be resolved by name."},
+                "since": {"type": "string", "description": "ISO 8601 timestamp to bound results by date_modified."},
+                "max_jobs": {"type": "integer", "default": 50, "description": "Cross-job scan cap (max 100)."},
                 "per_page": {"type": "integer", "default": 100},
             },
         },
@@ -1809,7 +1868,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": "2.1.0"},
+            "serverInfo": {"name": "cats-connector", "version": SERVER_VERSION},
         }))
 
     if method == "tools/list":
@@ -1846,4 +1905,4 @@ async def mcp_endpoint(key: str, request: Request):
 
 @app.get("/api/mcp/{key}")
 async def health(key: str):
-    return {"status": "ok", "server": "cats-connector", "time": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "server": "cats-connector", "version": SERVER_VERSION, "time": datetime.now(timezone.utc).isoformat()}

@@ -338,22 +338,23 @@ async def tool_read_resume(args: dict):
 
 
 async def tool_list_recent_candidates(args: dict):
+    since = args.get("since")
     per_page = args.get("per_page", 50)
     page = args.get("page", 1)
+
     _all = await _fetch_candidates_newest_first(pages=10, per_page=100)
     if since:
         _all = _since_filter(_all, since)
-    start = (page - 1) * per_page
-    data = {"_embedded": {"candidates": _all[start:start + per_page]}, "total": len(_all)}
 
-    since = args.get("since")
+    start = (page - 1) * per_page
+    data = {
+        "_embedded": {"candidates": _all[start:start + per_page]},
+        "total": len(_all),
+    }
     if since:
-        items = _since_filter(data.get("_embedded", {}).get("candidates", []), since)
-        data["_embedded"]["candidates"] = items
         data["filtered_since"] = since
 
     return data
-
 
 # ---- New: candidate flags (tags, custom fields, cross-job history) -------
 

@@ -122,3 +122,92 @@ Fixes a cluster of bugs found in live testing, all rooted in two causes: CATS re
 ### Still to verify live after this deploy
 - `search_pipelines_by_status` — errored on both paths before; with real error reporting now on, re-run it and the response will say what CATS actually rejects (likely the `/pipelines/filter` body shape).
 - **Contacts** — `search_contacts` returns zero even for broad terms. Grab one real contact ID from the CATS UI (open a client contact; the ID is in the URL) and run `get_contact` with it — that single call will confirm whether contacts are barely populated or the endpoint path is wrong.
+
+## v3.0.0 (July 2026) — write-endpoint verification pass
+
+Every write endpoint was checked against the live CATS v3 docs. Two of the two
+"inferred" endpoints exercised so far turned out to be wrong, so this release
+verifies rather than infers.
+
+### Fixed
+
+- **`publish_job_to_portal`** — was `POST /portals/{p}/jobs/{j}/publish`, which
+  does not exist. Correct: **`PUT /portals/{p}/jobs/{j}` with an empty `{}` body**
+  (returns 204). Note `POST` on that exact path is the *candidate application
+  submit* endpoint — the old code was never publishing, it was attempting to
+  lodge an application against the job.
+- **`search_pipelines_by_status`** — was `POST /pipelines/filter`, which does not
+  exist. Correct: **`POST /pipelines/search`** with a `{field, filter, value}`
+  body. **CATS does have a server-side pipeline filter** — the earlier note
+  saying otherwise was wrong. Filterable fields: `id`, `candidate_id`, `job_id`,
+  `status_id`, `rating`, `date_created`, `date_modified`. Cross-job status
+  queries are now a single server-side call instead of a per-job client-side scan.
+
+### Added
+
+- **`unpublish_job_from_portal`** — `DELETE /portals/{p}/jobs/{j}`. The safe undo.
+- **`update_job`** — `PUT /jobs/{id}`. Update title, description (ad copy),
+  location, salary, duration, notes. Previously the connector could create a job
+  and edit its notes but could never correct a title or revise ad copy, so any
+  post-creation change had to be done by hand in the CATS UI.
+  Read-modify-write: unpassed fields are preserved, so a title change cannot
+  silently blank the description. Preview shows a before/after per field.
+
+Tool count: **46 → 48**. Version string: `3.0.0`.
+
+### Verified correct (no change needed)
+
+- `add_candidate_tag` — `PUT /candidates/{id}/tags` is the additive *Attach*
+  endpoint; `POST` is the destructive *Replace*. The connector correctly uses
+  `PUT`, so tagging can never wipe an existing flag like "Never Employ".
+- `remove_candidate_tag` — `DELETE /candidates/{id}/tags/{tag_id}`.
+
+### Still inferred — treat as suspect
+
+- `change_pipeline_status`
+- `search_contacts` — returns zero results even for broad terms. Given the hit
+  rate on inferred endpoints, a wrong path is more likely than an empty table.
+
+### Unblocked by this release
+
+The never-employ / do-not-contact flag work. Every pipeline sitting at a given
+`status_id` can now be pulled in a single call, so once the exact status wording
+is confirmed, automated exclusion is cheap. It no longer requires walking full
+pipeline history candidate by candidate.
+
+### CATS API facts worth keeping
+
+- `per_page` is capped at **100** on every endpoint.
+- **All `PUT` endpoints require a JSON body**, even when empty — send `{}`.
+- Rate limit: 500 requests/hour, rolling; `429` returns a `Retry-After` header.
+- **Publishing to a CATS portal does not push to third-party job boards.**
+  SEEK is not reachable through this API — SEEK posting remains manual.
+
+### Deploy
+
+`api/index.py` — the file **must** sit under `api/`, not the repo root, or Vercel
+won't detect the FastAPI entrypoint and will keep serving the previous build.
+
+```
+git add .
+git commit -m "v3.0.0 — fix publish + pipelines endpoints, add update_job/unpublish"
+git push
+```
+
+Vercel redeploys automatically. No new env vars, no requirements changes, same
+connector URL.
+
+### Verify the deploy took
+
+Claude caches the tool manifest per conversation, so check the server directly:
+
+```
+curl -s -X POST "https://cats-mcp-server.vercel.app/api/mcp/<CONNECTOR_SHARED_KEY>" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+Count the tools: **48 = deployed. 46 = still on the old build.** Then start a
+**fresh chat** — a conversation already open will keep using the stale 46-tool
+manifest.

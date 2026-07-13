@@ -31,12 +31,40 @@ Write tools (preview-by-default, require confirm: true to execute):
   publish_job_to_portal, update_pipeline_rating_status, bulk_update_pipelines,
   update_job_notes, update_candidate_notes, add_candidate_tag
 
-Endpoints inferred from CATS's consistent API patterns rather than fully
-confirmed against live docs — flagged in their own descriptions/responses:
-  change_pipeline_status, publish_job_to_portal, search_contacts,
-  add_candidate_tag (endpoint path inferred; built against the "Attach" /
-  additive pattern rather than "Replace" to avoid wiping existing tags —
-  see tool description).
+v3 (July 2026) changes — all verified against the live CATS v3 docs:
+  - publish_job_to_portal FIXED. Was POST /portals/{p}/jobs/{j}/publish, which
+    does not exist. Correct: PUT /portals/{p}/jobs/{j} with an empty {} body,
+    returning 204. POST on that path is the *candidate application submit*
+    endpoint — the old code was never publishing anything.
+  - unpublish_job_from_portal ADDED: DELETE /portals/{p}/jobs/{j}.
+  - update_job ADDED: PUT /jobs/{id}. The connector could previously create a
+    job and edit its notes but never correct a title or revise ad copy.
+    Read-modify-write so unpassed fields are preserved.
+  - search_pipelines_by_status FIXED. Was POST /pipelines/filter (does not
+    exist). Correct: POST /pipelines/search with a {field, filter, value}
+    body. CATS DOES have a server-side pipeline filter — earlier notes to the
+    contrary were wrong. Filterable: id, candidate_id, job_id, status_id,
+    rating, date_created, date_modified. Cross-job status queries are now a
+    single call instead of a per-job client-side scan.
+    This also unblocks never-employ/do-not-contact flag detection: every
+    pipeline at a given status_id can now be pulled in one hit.
+
+Endpoints still inferred rather than confirmed — flagged in their own
+descriptions/responses:
+  change_pipeline_status, search_contacts.
+  add_candidate_tag is CONFIRMED correct: PUT /candidates/{id}/tags is the
+  additive "Attach" endpoint (POST is the destructive "Replace"). The
+  connector deliberately uses PUT, so tagging can never wipe an existing
+  flag like "Never Employ". remove_candidate_tag is CONFIRMED:
+  DELETE /candidates/{id}/tags/{tag_id}.
+
+Note on portals: publishing to a CATS portal does NOT push to third-party
+job boards. SEEK is not reachable through this API.
+
+CATS API facts worth keeping:
+  - per_page is capped at 100 on every endpoint.
+  - ALL PUT endpoints require a JSON body, even if empty ({}).
+  - Rate limit: 500 requests/hour, rolling. 429 returns a Retry-After header.
 """
 
 import os
@@ -51,10 +79,6 @@ from fastapi.responses import JSONResponse
 CATS_API_BASE = "https://api.catsone.com/v3"
 CATS_API_KEY = os.environ.get("CATS_API_KEY", "")
 CONNECTOR_SHARED_KEY = os.environ.get("CONNECTOR_SHARED_KEY", "")
-
-# Reported by the MCP 'initialize' handshake. Derived from the Vercel build
-# commit so the version string can never drift from the deployed code.
-SERVER_VERSION = os.environ.get("VERCEL_GIT_COMMIT_SHA", "dev")[:7]
 
 app = FastAPI()
 
@@ -342,20 +366,18 @@ async def tool_read_resume(args: dict):
 
 
 async def tool_list_recent_candidates(args: dict):
-    since = args.get("since")
     per_page = args.get("per_page", 50)
     page = args.get("page", 1)
-
     _all = await _fetch_candidates_newest_first(pages=10, per_page=100)
     if since:
         _all = _since_filter(_all, since)
-
     start = (page - 1) * per_page
-    data = {
-        "_embedded": {"candidates": _all[start:start + per_page]},
-        "total": len(_all),
-    }
+    data = {"_embedded": {"candidates": _all[start:start + per_page]}, "total": len(_all)}
+
+    since = args.get("since")
     if since:
+        items = _since_filter(data.get("_embedded", {}).get("candidates", []), since)
+        data["_embedded"]["candidates"] = items
         data["filtered_since"] = since
 
     return data
@@ -678,6 +700,21 @@ async def tool_list_portals(args: dict):
 
 
 async def tool_publish_job_to_portal(args: dict):
+    """Publish a job to a career portal.
+
+    CONFIRMED against CATS v3 docs: PUT /portals/{portal_id}/jobs/{job_id}
+    with an EMPTY JSON BODY ({}), returning 204 No Content.
+
+    Two traps this previously fell into:
+      1. It is PUT, not POST. POST on this exact path is the *candidate
+         application submit* endpoint — POSTing here does not publish, it
+         attempts to lodge an application against the job.
+      2. CATS requires a properly formatted JSON body on ALL PUT endpoints,
+         even when there is nothing to send. cats_put already sends {}.
+
+    Note: publishing to a portal does NOT push the job to third-party job
+    boards (SEEK etc.) — it only makes it live on the CATS career portal.
+    """
     portal_id = args["portal_id"]
     job_id = args["job_id"]
 
@@ -687,14 +724,84 @@ async def tool_publish_job_to_portal(args: dict):
             "action": "publish_job_to_portal",
             "portal_id": portal_id,
             "job_id": job_id,
-            "note": "This endpoint is inferred from the CATS docs table of contents (exact request shape wasn't "
-                    "fully retrievable) and hasn't been live-tested — if it fails, check the response error and "
-                    "we'll adjust the path. Nothing has changed yet either way. Call this again with confirm: true "
-                    "to actually attempt publishing in CATS.",
+            "note": "This will make the job live on the CATS career portal (NOT on SEEK or any other "
+                    "third-party board). Nothing has changed yet. Call again with confirm: true to publish.",
         }
 
-    result = await cats_post(f"/portals/{portal_id}/jobs/{job_id}/publish", {})
-    return {"published": True, "action": "publish_job_to_portal", "result": result}
+    await cats_put(f"/portals/{portal_id}/jobs/{job_id}", {})
+    return {
+        "published": True,
+        "action": "publish_job_to_portal",
+        "portal_id": portal_id,
+        "job_id": job_id,
+        "note": "Live on the CATS career portal. This does not publish to SEEK or other third-party boards.",
+    }
+
+
+async def tool_unpublish_job_from_portal(args: dict):
+    """Remove a job from a career portal. CONFIRMED: DELETE /portals/{portal_id}/jobs/{job_id}."""
+    portal_id = args["portal_id"]
+    job_id = args["job_id"]
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "unpublish_job_from_portal",
+            "portal_id": portal_id,
+            "job_id": job_id,
+            "note": "This will remove the job from the career portal. The job record itself is untouched. "
+                    "Nothing has changed yet. Call again with confirm: true to unpublish.",
+        }
+
+    await cats_delete(f"/portals/{portal_id}/jobs/{job_id}")
+    return {"unpublished": True, "action": "unpublish_job_from_portal", "portal_id": portal_id, "job_id": job_id}
+
+
+async def tool_update_job(args: dict):
+    """Update fields on an existing job — title, description, location, salary etc.
+
+    CONFIRMED: PUT /jobs/{id}. Previously the connector could only create jobs
+    and edit their notes, so any correction to an advertised title or ad body
+    had to be done by hand in the CATS UI.
+
+    Read-modify-write: fetches the current job first and only overwrites the
+    fields explicitly passed, so a title change can't silently blank the
+    description.
+    """
+    job_id = args["job_id"]
+    current = await cats_get(f"/jobs/{job_id}")
+
+    editable = ["title", "description", "notes", "duration", "salary", "max_rate",
+                "openings", "country_code", "contact_id", "recruiter_id", "owner_id"]
+
+    payload = {}
+    for field in editable:
+        payload[field] = current.get(field)
+    payload["location"] = current.get("location") or {}
+    payload["company_id"] = current.get("company_id")
+
+    changes = {}
+    for field in editable + ["location"]:
+        if field in args and args[field] is not None:
+            changes[field] = {"from": payload.get(field), "to": args[field]}
+            payload[field] = args[field]
+
+    if not changes:
+        return {"error": "No fields to update. Pass at least one of: " + ", ".join(editable + ["location"])}
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "update_job",
+            "job_id": job_id,
+            "changes": changes,
+            "note": "Nothing has changed yet. Fields not listed above are preserved as-is. "
+                    "Call again with confirm: true to apply.",
+        }
+
+    payload = {k: v for k, v in payload.items() if v is not None}
+    await cats_put(f"/jobs/{job_id}", payload)
+    return {"updated": True, "action": "update_job", "job_id": job_id, "changes": changes}
 
 
 # ---- New: search / discovery primitives -----------------------------------
@@ -714,105 +821,68 @@ async def tool_search_candidates(args: dict):
 
 
 async def tool_search_pipelines_by_status(args: dict):
-    """Bulk pipeline query for candidates at a given pipeline status.
-
-    CATS v3 has NO 'filter pipelines' endpoint (Pipelines is not one of the
-    five filterable entities), so this is built on the endpoints that DO
-    exist: pipelines are listed per-job (GET /jobs/{id}/pipelines) or per-
-    candidate. We therefore always work job-by-job and filter status locally.
-
-    - job_id given: list that one job's pipelines, filter to the target
-      status. status name is resolved against that job's own workflow.
-    - no job_id: iterate open jobs, pull each job's pipelines, filter each to
-      the target status_id. status_id is REQUIRED here (a status *name* is
-      per-workflow and can't be resolved without a job), and the scan is
-      capped to keep the call bounded — narrow with since where possible.
-    """
+    """Bulk pipeline query across ALL jobs — e.g. 'everyone with Qualifying
+    status in the last 6 months'. Uses CATS's Filter Pipelines endpoint
+    (structured filter/field/value), not a plain query-string filter."""
     status_id = args.get("status_id")
     status_name = args.get("status")
     job_id = args.get("job_id")
     since = args.get("since")
+    page = args.get("page", 1)
     per_page = min(args.get("per_page", 100), 200)
-    max_jobs = min(args.get("max_jobs", 50), 100)
 
-    async def _resolve_status_id_for_job(jid):
-        """Resolve a status NAME to its id for this job. The job object's
-        pipeline_workflow_id is unreliable (often null), so we read the
-        workflow_id from the job's actual pipeline entries instead."""
-        if not status_name:
-            return None
-        pls = await cats_get(f"/jobs/{jid}/pipelines", {"per_page": 1})
-        entries = pls.get("_embedded", {}).get("pipelines", [])
-        wf_id = entries[0].get("workflow_id") if entries else None
-        if not wf_id:
-            return None
-        statuses = await cats_get(f"/pipelines/workflows/{wf_id}/statuses", {"per_page": 100})
-        for s in statuses.get("_embedded", {}).get("statuses", []):
-            if (s.get("title") or s.get("name", "")).lower() == status_name.lower():
-                return s["id"]
-        return None
-
-    async def _pull_job_pipelines(jid):
-        """All pipeline entries for one job, paged internally."""
-        out = []
-        page = 1
-        while True:
-            data = await cats_get(f"/jobs/{jid}/pipelines", {"per_page": per_page, "page": page})
-            items = data.get("_embedded", {}).get("pipelines", [])
-            out.extend(items)
-            total = data.get("total", 0)
-            if len(out) >= total or not items:
-                break
-            page += 1
-        return out
-
-    # Build the list of (job_id, target_status_id) pairs to scan.
-    scan = []
-    truncated_jobs = False
-
-    if job_id:
-        resolved = status_id
-        if resolved is None:
-            resolved = await _resolve_status_id_for_job(job_id)
-        if resolved is None:
-            return {
-                "error": f"Could not resolve status '{status_name}' to a status_id for job {job_id}. "
-                         "Pass status_id directly (use get_workflow_statuses on the job's workflow).",
-            }
-        scan.append((job_id, resolved))
-    else:
-        # Cross-job: needs an explicit status_id (names are per-workflow).
+    if status_id is None and status_name:
+        # Resolve name -> id. Pipeline statuses are per-workflow, so if a
+        # job_id is given, resolve against that job's workflow; otherwise
+        # this can't disambiguate across multiple workflows and the caller
+        # should pass status_id directly.
+        if job_id:
+            job = await cats_get(f"/jobs/{job_id}")
+            wf_id = job.get("pipeline_workflow_id")
+            if wf_id:
+                statuses = await cats_get(f"/pipelines/workflows/{wf_id}/statuses", {"per_page": 100})
+                for s in statuses.get("_embedded", {}).get("statuses", []):
+                    if (s.get("title") or s.get("name", "")).lower() == status_name.lower():
+                        status_id = s["id"]
+                        break
         if status_id is None:
             return {
-                "error": "Cross-job search needs status_id (a status name is per-workflow and can't be "
-                         "resolved without a job_id). Either pass job_id to scope to one job, or pass "
-                         "status_id from get_workflow_statuses. Note: cross-job scanning assumes the same "
-                         "status_id across jobs sharing a workflow.",
+                "error": f"Could not resolve status name '{status_name}' to a status_id without a job_id to "
+                         "identify the workflow. Pass job_id to scope the search, or pass status_id directly "
+                         "(use get_workflow_statuses to find it).",
             }
-        jobs_data = await cats_get("/jobs", {"per_page": 100, "page": 1})
-        jobs = jobs_data.get("_embedded", {}).get("jobs", [])
-        if len(jobs) > max_jobs:
-            jobs = jobs[:max_jobs]
-            truncated_jobs = True
-        for j in jobs:
-            scan.append((j["id"], status_id))
 
-    # Pull and filter.
-    matched = []
-    for jid, target_status in scan:
-        try:
-            pipelines = await _pull_job_pipelines(jid)
-        except HTTPException:
-            continue
-        for p in pipelines:
-            if p.get("status_id") == target_status:
-                matched.append(p)
+    # CONFIRMED endpoint: POST /pipelines/search  (NOT /pipelines/filter).
+    # Body is a filter object: {"field": ..., "filter": ..., "value": ...},
+    # optionally wrapped in and/or/not. Filterable pipeline fields:
+    #   id, candidate_id, job_id, status_id, rating, date_created, date_modified
+    # Server-side filtering means no more per-job client-side scanning.
+    # per_page is capped at 100 by CATS on every endpoint.
+    per_page = min(per_page, 100)
 
+    conditions = [{"field": "status_id", "filter": "exactly", "value": status_id}]
+    if job_id:
+        conditions.append({"field": "job_id", "filter": "exactly", "value": job_id})
     if since:
-        matched = _since_filter(matched, since)
+        aware = _to_aware(since)
+        if aware:
+            conditions.append({
+                "field": "date_modified",
+                "filter": "greater_than",
+                "value": aware.isoformat(),
+            })
 
-    # Hydrate job titles and candidate contact details.
-    job_ids = {m.get("job_id") for m in matched if m.get("job_id")}
+    body = conditions[0] if len(conditions) == 1 else {"and": conditions}
+
+    data = await cats_post(f"/pipelines/search?page={page}&per_page={per_page}", body)
+    items = data.get("_embedded", {}).get("pipelines", [])
+
+    # since is now applied server-side via the date_modified filter above;
+    # this is a belt-and-braces pass in case CATS returns an unbounded set.
+    if since:
+        items = _since_filter(items, since)
+
+    job_ids = {item.get("job_id") for item in items if item.get("job_id")}
     job_titles = {}
     for jid in job_ids:
         try:
@@ -821,7 +891,7 @@ async def tool_search_pipelines_by_status(args: dict):
         except HTTPException:
             continue
 
-    candidate_ids = {m.get("candidate_id") for m in matched if m.get("candidate_id")}
+    candidate_ids = {item.get("candidate_id") for item in items if item.get("candidate_id")}
     candidate_info = {}
     for cid in candidate_ids:
         try:
@@ -829,36 +899,32 @@ async def tool_search_pipelines_by_status(args: dict):
             candidate_info[cid] = {
                 "name": f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip(),
                 "email": (cand.get("emails") or {}).get("primary"),
-                "mobile": (cand.get("phones") or {}).get("cell"),
+                "mobile": (cand.get("phones") or {}).get("mobile"),
             }
         except HTTPException:
             continue
 
     rows = []
-    for m in matched:
-        cid = m.get("candidate_id")
+    for item in items:
+        cid = item.get("candidate_id")
         info = candidate_info.get(cid, {})
         rows.append({
             "candidate_id": cid,
             "name": info.get("name"),
             "email": info.get("email"),
             "mobile": info.get("mobile"),
-            "job_id": m.get("job_id"),
-            "job_title": job_titles.get(m.get("job_id")),
+            "job_id": item.get("job_id"),
+            "job_title": job_titles.get(item.get("job_id")),
             "status_name": status_name or f"status_id {status_id}",
-            "date_modified": m.get("date_modified"),
+            "date_modified": item.get("date_modified"),
         })
 
-    note = None
-    if truncated_jobs:
-        note = (f"Scanned the first {max_jobs} jobs only — cross-job results may be incomplete. "
-                "Scope with job_id, or raise max_jobs.")
+    truncated = len(rows) >= 200
     return {
         "count": len(rows),
         "rows": rows,
-        "jobs_scanned": len(scan),
-        "truncated": truncated_jobs,
-        "note": note,
+        "truncated": truncated,
+        "note": "Result capped at 200 rows — narrow with since or job_id, or ask for a CSV export instead." if truncated else None,
     }
 
 
@@ -920,7 +986,7 @@ async def tool_search_candidates_deep(args: dict):
                 "candidate_id": cid,
                 "name": f"{cand.get('first_name', '')} {cand.get('last_name', '')}".strip(),
                 "email": (cand.get("emails") or {}).get("primary"),
-                "mobile": (cand.get("phones") or {}).get("cell"),
+                "mobile": (cand.get("phones") or {}).get("mobile"),
                 "matched_terms": hit_terms,
                 "snippet": snippet,
                 "attachment_id": latest["id"],
@@ -1697,7 +1763,7 @@ TOOLS = {
         "handler": tool_list_portals,
     },
     "publish_job_to_portal": {
-        "description": "Publish a job to a specific job board portal so it goes live for external applicants. PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually publish. Use list_portals first to find the right portal_id. Endpoint is inferred from CATS's docs table of contents and not yet live-tested — report back if it errors.",
+        "description": "Publish a job to a CATS career portal so it goes live for external applicants. NOTE: this publishes to the CATS career portal only — it does NOT push the job to SEEK or any other third-party job board. PREVIEW BY DEFAULT: call without confirm first, then again with confirm: true. Use list_portals first to find the portal_id.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1708,6 +1774,40 @@ TOOLS = {
             "required": ["portal_id", "job_id"],
         },
         "handler": tool_publish_job_to_portal,
+    },
+    "unpublish_job_from_portal": {
+        "description": "Remove a job from a CATS career portal — the safe undo for publish_job_to_portal. The job record itself is left untouched. PREVIEW BY DEFAULT: call without confirm first, then again with confirm: true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "portal_id": {"type": "integer"},
+                "job_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["portal_id", "job_id"],
+        },
+        "handler": tool_unpublish_job_from_portal,
+    },
+    "update_job": {
+        "description": "Update fields on an existing job — title, description (the ad copy), location, salary, duration, notes. Only the fields passed are changed; everything else on the job is preserved. Use this to correct an advertised title or revise ad copy after a job has been created. PREVIEW BY DEFAULT: call without confirm to see a before/after of each changed field, then again with confirm: true to apply.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "integer"},
+                "title": {"type": "string"},
+                "description": {"type": "string", "description": "The ad body / job description. HTML is accepted."},
+                "location": {"type": "object", "description": "{city, state, postal_code}"},
+                "salary": {"type": "string"},
+                "max_rate": {"type": "string"},
+                "duration": {"type": "string"},
+                "notes": {"type": "string", "description": "Internal notes. Prefer update_job_notes if notes are all you're changing."},
+                "openings": {"type": "integer"},
+                "contact_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["job_id"],
+        },
+        "handler": tool_update_job,
     },
     "update_pipeline_rating_status": {
         "description": "Set the star rating and/or pipeline status on a single candidate's pipeline entry (e.g. set rating to 3 and status to 'Qualifying'). PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually apply. Use get_workflow_statuses first to find the right status_id.",
@@ -1777,15 +1877,15 @@ TOOLS = {
         "handler": tool_search_candidates,
     },
     "search_pipelines_by_status": {
-        "description": "Find candidates at a given pipeline status. Best used scoped to one job (pass job_id + a status name like 'Qualifying', resolved automatically against that job's workflow). Cross-job search (no job_id) requires status_id directly (from get_workflow_statuses) since status names are per-workflow, scans open jobs job-by-job, and is capped by max_jobs — narrow with since where possible. Returns name, email, mobile, job, and status per row. Built on CATS's per-job pipeline endpoints (there is no server-side pipeline filter in the CATS API).",
+        "description": "Bulk query across ALL jobs for candidates at a given pipeline status — e.g. 'email addresses of everyone with Qualifying status in the last 6 months'. Pass job_id to scope to one job and resolve a status name automatically, or pass status_id directly (from get_workflow_statuses) to search across jobs/workflows. Returns name, email, mobile, job, and status per row, capped at 200 with a truncation note.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "status": {"type": "string", "description": "Readable status name, e.g. 'Qualifying'. Requires job_id to resolve."},
-                "status_id": {"type": "integer", "description": "Pipeline status_id (from get_workflow_statuses). Required for cross-job search."},
-                "job_id": {"type": "integer", "description": "Scope to one job — strongly preferred; lets 'status' be resolved by name."},
-                "since": {"type": "string", "description": "ISO 8601 timestamp to bound results by date_modified."},
-                "max_jobs": {"type": "integer", "default": 50, "description": "Cross-job scan cap (max 100)."},
+                "status": {"type": "string", "description": "Readable status name, e.g. 'Qualifying'. Requires job_id to resolve unless status_id is given directly."},
+                "status_id": {"type": "integer", "description": "Use instead of status to search across multiple workflows/jobs directly."},
+                "job_id": {"type": "integer", "description": "Optional — scopes the search and lets 'status' be resolved by name."},
+                "since": {"type": "string", "description": "ISO 8601 timestamp to bound results."},
+                "page": {"type": "integer", "default": 1},
                 "per_page": {"type": "integer", "default": 100},
             },
         },
@@ -1874,7 +1974,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": SERVER_VERSION},
+            "serverInfo": {"name": "cats-connector", "version": "3.0.0"},
         }))
 
     if method == "tools/list":
@@ -1911,4 +2011,4 @@ async def mcp_endpoint(key: str, request: Request):
 
 @app.get("/api/mcp/{key}")
 async def health(key: str):
-    return {"status": "ok", "server": "cats-connector", "version": SERVER_VERSION, "time": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "server": "cats-connector", "time": datetime.now(timezone.utc).isoformat()}

@@ -1172,13 +1172,49 @@ async def tool_list_candidate_activities(args: dict):
     return await cats_get(f"/candidates/{candidate_id}/activities", {"per_page": per_page, "page": page})
 
 
+# CATS rejects any activity type outside its own enum. The confirmed valid
+# values are: other, call_talked, call_lvm, call_missed, email (CATS truncates
+# the rest of the list in its error message). "note" and "meeting" are NOT
+# valid — passing them returns "Validation failed." and nothing is written.
+#
+# This map lets callers keep using natural words while we send CATS something
+# it accepts. Anything unrecognised falls back to "other", which is CATS's own
+# catch-all, so a new/unknown type can never hard-fail a write again.
+ACTIVITY_TYPE_MAP = {
+    "note": "other",
+    "meeting": "other",
+    "other": "other",
+    "call": "call_talked",
+    "call_talked": "call_talked",
+    "talked": "call_talked",
+    "call_lvm": "call_lvm",
+    "lvm": "call_lvm",
+    "voicemail": "call_lvm",
+    "call_missed": "call_missed",
+    "missed": "call_missed",
+    "email": "email",
+}
+
+
+def map_activity_type(value) -> str:
+    """Map a friendly activity type onto a value CATS will accept.
+
+    Defaults to 'other' — both when no type is given and when the type is
+    unrecognised — because 'other' is the one value CATS always allows.
+    """
+    if not value:
+        return "other"
+    return ACTIVITY_TYPE_MAP.get(str(value).strip().lower(), "other")
+
+
 async def tool_create_candidate_activity(args: dict):
     """Log a call, email summary, meeting, or note against a candidate as a
     proper timestamped activity (the durable alternative to overwriting the
     single notes field). 'date' is when the activity occurred; CATS sets
-    date_created itself. Endpoint inferred — report back if it errors."""
+    date_created itself. Friendly type names ('note', 'meeting', 'call') are
+    mapped onto CATS's own enum — see ACTIVITY_TYPE_MAP."""
     candidate_id = args["candidate_id"]
-    activity_type = args.get("type", "note")
+    activity_type = map_activity_type(args.get("type"))
     notes = args["notes"]
     date = args.get("date")
 
@@ -1200,8 +1236,7 @@ async def tool_create_candidate_activity(args: dict):
 
 async def tool_list_contact_activities(args: dict):
     """Interaction history for a contact (client-side: hiring manager calls,
-    briefs, feedback). Endpoint inferred from the candidate pattern —
-    report back if it errors."""
+    briefs, feedback)."""
     contact_id = args["contact_id"]
     per_page = args.get("per_page", 50)
     page = args.get("page", 1)
@@ -1210,9 +1245,9 @@ async def tool_list_contact_activities(args: dict):
 
 async def tool_create_contact_activity(args: dict):
     """Log a call, meeting, or note against a contact. Preview-by-default.
-    Endpoint inferred — report back if it errors."""
+    Friendly type names are mapped onto CATS's enum — see ACTIVITY_TYPE_MAP."""
     contact_id = args["contact_id"]
-    activity_type = args.get("type", "note")
+    activity_type = map_activity_type(args.get("type"))
     notes = args["notes"]
     date = args.get("date")
 
@@ -1407,12 +1442,16 @@ TOOLS = {
         "handler": tool_list_candidate_activities,
     },
     "create_candidate_activity": {
-        "description": "Log a call, email summary, meeting or note against a candidate as a timestamped activity — use this instead of update_candidate_notes for interaction records. 'date' = when it occurred. Preview-by-default; requires confirm: true to execute.",
+        "description": "Log a call, email summary, meeting or note against a candidate as a timestamped activity — use this instead of update_candidate_notes for interaction records (notes OVERWRITES; activities are additive). 'date' = when it occurred. Type defaults to 'other'; friendly names are mapped to CATS's enum. Preview-by-default; requires confirm: true to execute.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "candidate_id": {"type": "integer"},
-                "type": {"type": "string", "description": "call, email, meeting, note, other", "default": "note"},
+                "type": {
+                    "type": "string",
+                    "description": "Activity type. CATS's own values are: other, call_talked, call_lvm, call_missed, email. Friendly names are accepted and mapped: 'note' and 'meeting' -> other, 'call' -> call_talked, 'voicemail' -> call_lvm. Anything unrecognised falls back to 'other'. Default 'other'.",
+                    "default": "other",
+                },
                 "notes": {"type": "string"},
                 "date": {"type": "string", "description": "ISO 8601, when the activity occurred"},
                 "confirm": {"type": "boolean", "default": False},
@@ -1422,7 +1461,7 @@ TOOLS = {
         "handler": tool_create_candidate_activity,
     },
     "list_contact_activities": {
-        "description": "Interaction history for a client contact — hiring manager calls, briefs, feedback. (Endpoint inferred — report back if it errors.)",
+        "description": "Interaction history for a client contact — hiring manager calls, briefs, feedback.",
         "inputSchema": {
             "type": "object",
             "properties": {"contact_id": {"type": "integer"}, "per_page": {"type": "integer", "default": 50}, "page": {"type": "integer", "default": 1}},
@@ -1436,7 +1475,11 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "contact_id": {"type": "integer"},
-                "type": {"type": "string", "default": "note"},
+                "type": {
+                    "type": "string",
+                    "description": "Activity type. CATS's own values are: other, call_talked, call_lvm, call_missed, email. Friendly names are mapped: 'note'/'meeting' -> other, 'call' -> call_talked. Default 'other'.",
+                    "default": "other",
+                },
                 "notes": {"type": "string"},
                 "date": {"type": "string"},
                 "confirm": {"type": "boolean", "default": False},

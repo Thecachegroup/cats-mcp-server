@@ -368,18 +368,14 @@ async def tool_read_resume(args: dict):
 async def tool_list_recent_candidates(args: dict):
     per_page = args.get("per_page", 50)
     page = args.get("page", 1)
+    since = args.get("since")
     _all = await _fetch_candidates_newest_first(pages=10, per_page=100)
     if since:
         _all = _since_filter(_all, since)
     start = (page - 1) * per_page
     data = {"_embedded": {"candidates": _all[start:start + per_page]}, "total": len(_all)}
-
-    since = args.get("since")
     if since:
-        items = _since_filter(data.get("_embedded", {}).get("candidates", []), since)
-        data["_embedded"]["candidates"] = items
         data["filtered_since"] = since
-
     return data
 
 
@@ -1388,6 +1384,152 @@ async def tool_remove_candidate_tag(args: dict):
     return {"changed": True, "action": "remove_candidate_tag", "candidate_id": candidate_id, "tag_id": tag_id, "result": result}
 
 
+# ---- Microsoft Graph email (send as careers@) ----------------------------
+# Sends candidate email via Microsoft Graph, because the CATS API has NO
+# candidate-email send endpoint. Auth is client-credentials against an Entra
+# app registration ("CATS Connector - Candidate Email") with Mail.Send
+# application permission. The three values below live in Vercel env vars,
+# never in code.
+GRAPH_TENANT_ID = os.environ.get("GRAPH_TENANT_ID", "")
+GRAPH_CLIENT_ID = os.environ.get("GRAPH_CLIENT_ID", "")
+GRAPH_CLIENT_SECRET = os.environ.get("GRAPH_CLIENT_SECRET", "")
+
+# Hard allow-list of mailboxes this connector may send AS. Even though the
+# Entra app can technically send as any mailbox, the connector refuses any
+# sender not in this list — so a bug or bad argument can never email as a
+# random staff member. Add addresses here (lowercased) to permit more.
+ALLOWED_SEND_AS = {"careers@thecachegroup.com.au"}
+
+# Status to move a candidate to after a screening question is sent.
+# "Contacted Pending" in workflow 5369421 (confirmed via get_workflow_statuses).
+CONTACTED_PENDING_STATUS_ID = 5920435
+
+
+async def graph_get_token():
+    """Client-credentials token for Microsoft Graph. Raises 500 with a clear
+    message if the three env vars aren't configured."""
+    if not (GRAPH_TENANT_ID and GRAPH_CLIENT_ID and GRAPH_CLIENT_SECRET):
+        raise HTTPException(
+            status_code=500,
+            detail="Microsoft Graph is not configured: set GRAPH_TENANT_ID, "
+                   "GRAPH_CLIENT_ID and GRAPH_CLIENT_SECRET in Vercel env vars.",
+        )
+    url = f"https://login.microsoftonline.com/{GRAPH_TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "client_id": GRAPH_CLIENT_ID,
+        "scope": "https://graph.microsoft.com/.default",
+        "client_secret": GRAPH_CLIENT_SECRET,
+        "grant_type": "client_credentials",
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(url, data=data)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code,
+                                detail=f"Graph token request failed: {resp.text[:400]}")
+        return resp.json().get("access_token")
+
+
+async def graph_send_mail(send_as: str, to_address: str, subject: str, body_text: str):
+    """Send a plain-text email as `send_as` to `to_address` via Graph sendMail.
+    Saves to the sender's Sent Items. Returns nothing on success (Graph gives
+    202 with an empty body); raises HTTPException on failure."""
+    token = await graph_get_token()
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "Text", "content": body_text},
+            "toRecipients": [{"emailAddress": {"address": to_address}}],
+        },
+        "saveToSentItems": True,
+    }
+    url = f"https://graph.microsoft.com/v1.0/users/{send_as}/sendMail"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code,
+                                detail=f"Graph sendMail failed: {resp.text[:400]}")
+    return True
+
+
+async def tool_send_candidate_email(args: dict):
+    """Send a screening question to a candidate as careers@ (via Microsoft
+    Graph — CATS has no send endpoint). PREVIEW BY DEFAULT.
+
+    On confirm it: (1) sends the email, (2) logs a CATS activity on the
+    candidate recording the send, (3) leaves the star rating untouched, and
+    (4) if pipeline_id is given, moves that pipeline entry to 'Contacted
+    Pending'. Send is restricted to the ALLOWED_SEND_AS list.
+    """
+    to_address = args["to"]
+    subject = args["subject"]
+    body_text = args["body"]
+    send_as = (args.get("send_as") or "careers@thecachegroup.com.au").strip().lower()
+    candidate_id = args.get("candidate_id")
+    pipeline_id = args.get("pipeline_id")
+
+    if send_as not in ALLOWED_SEND_AS:
+        return {
+            "error": f"send_as '{send_as}' is not permitted. This connector may only "
+                     f"send as: {sorted(ALLOWED_SEND_AS)}.",
+        }
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "send_candidate_email",
+            "would_send_from": send_as,
+            "to": to_address,
+            "subject": subject,
+            "body": body_text,
+            "candidate_id": candidate_id,
+            "pipeline_id": pipeline_id,
+            "on_send_will_also": [
+                "log a CATS activity on the candidate (if candidate_id given)",
+                "leave the star rating unchanged",
+                f"move pipeline to 'Contacted Pending' (status {CONTACTED_PENDING_STATUS_ID}) (if pipeline_id given)",
+            ],
+            "note": "Nothing has been sent yet. Call again with confirm: true to actually send this email.",
+        }
+
+    # 1. Send the email — this is the critical step.
+    await graph_send_mail(send_as, to_address, subject, body_text)
+
+    result = {"sent": True, "action": "send_candidate_email", "to": to_address, "from": send_as}
+    side_effects = {}
+
+    # 2. Log a CATS activity (non-fatal — the send already succeeded).
+    if candidate_id:
+        try:
+            await cats_post(
+                f"/candidates/{candidate_id}/activities",
+                {"type": "email",
+                 "notes": f"Screening question sent from {send_as}. Subject: {subject}"},
+            )
+            side_effects["cats_activity_logged"] = True
+        except HTTPException as e:
+            side_effects["cats_activity_logged"] = False
+            side_effects["cats_activity_error"] = str(e.detail)
+
+    # 3. Rating: deliberately left untouched — no code path changes it.
+
+    # 4. Move pipeline to Contacted Pending (non-fatal).
+    if pipeline_id:
+        try:
+            await cats_post(f"/pipelines/{pipeline_id}/status",
+                            {"status_id": CONTACTED_PENDING_STATUS_ID})
+            side_effects["moved_to_contacted_pending"] = True
+        except HTTPException as e:
+            side_effects["moved_to_contacted_pending"] = False
+            side_effects["status_move_error"] = str(e.detail)
+
+    result["side_effects"] = side_effects
+    return result
+
+
 # ---- Contacts & jobs: small read gaps ----------------------------------
 
 async def tool_get_contact(args: dict):
@@ -1407,6 +1549,24 @@ async def tool_get_job_applications(args: dict):
 
 
 TOOLS = {
+    # ---- v3.1: candidate email send ----
+    "send_candidate_email": {
+        "description": "Send a screening question to a candidate by email, sent AS careers@thecachegroup.com.au via Microsoft Graph (CATS itself has no candidate-email send endpoint). Use for the 'one question from a higher rating' workflow: surface the candidates, get Andrew's approval, then send. PREVIEW BY DEFAULT: call without confirm to show exactly what would be sent and to whom. Call again with confirm: true to actually send. On send it also logs a CATS activity on the candidate, leaves the star rating unchanged, and (if pipeline_id is given) moves the candidate to the 'Contacted Pending' pipeline status. send_as is restricted to an allow-list (currently careers@ only).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Candidate's email address."},
+                "subject": {"type": "string", "description": "e.g. 'Your application for the [role] role'."},
+                "body": {"type": "string", "description": "Plain-text email body, including greeting, up to two questions, and the plain-text sign-off. No logo/HTML."},
+                "send_as": {"type": "string", "description": "Sender mailbox. Defaults to careers@thecachegroup.com.au. Must be in the connector's allow-list.", "default": "careers@thecachegroup.com.au"},
+                "candidate_id": {"type": "integer", "description": "CATS candidate id — if given, the send is logged as an activity on the candidate."},
+                "pipeline_id": {"type": "integer", "description": "CATS pipeline id — if given, the candidate is moved to 'Contacted Pending' after sending."},
+                "confirm": {"type": "boolean", "default": False},
+            },
+            "required": ["to", "subject", "body"],
+        },
+        "handler": tool_send_candidate_email,
+    },
     # ---- v2 additions ----
     "filter_jobs": {
         "description": "Filtered job pull in ONE call — the connector scans all job pages internally and returns only matches. Filters: [{field, op, value}]. Fields: date_created/date_modified (ops '>=', '<='), status_id/company_id (eq), title (contains). Use this instead of paging list_jobs for 'jobs since date X' questions.",
@@ -2017,7 +2177,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": "3.0.0"},
+            "serverInfo": {"name": "cats-connector", "version": "3.1.0"},
         }))
 
     if method == "tools/list":

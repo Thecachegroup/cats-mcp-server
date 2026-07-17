@@ -304,12 +304,64 @@ async def tool_list_job_statuses(args: dict):
 
 
 async def tool_list_pipeline_candidates(args: dict):
-    job_id = args["job_id"]
-    per_page = args.get("per_page", 100)
-    page = args.get("page", 1)
-    data = await cats_get(f"/jobs/{job_id}/pipelines", {"per_page": per_page, "page": page})
+    """List every candidate on a job's pipeline.
 
-    items = data.get("_embedded", {}).get("pipelines", [])
+    CATS caps per_page at 100 on this endpoint, so a role with more than 100
+    applicants spans several pages. Earlier this tool returned only one page,
+    which silently hid everyone past the first 100 — a screening run could
+    therefore skip real applicants without anyone noticing. This version walks
+    ALL pages itself and returns the complete set in one response, so the
+    caller never has to page manually and can never be handed a partial list
+    by accident.
+
+    Escape hatches (unchanged behaviour when asked for explicitly):
+    - Pass an explicit `page` to fetch just that single page (old behaviour).
+    - `per_page` is still honoured but capped at 100 (CATS enforces this).
+    """
+    job_id = args["job_id"]
+    per_page = min(args.get("per_page", 100), 100)  # CATS hard-caps at 100
+    explicit_page = args.get("page")
+
+    async def _fetch_page(p):
+        return await cats_get(f"/jobs/{job_id}/pipelines", {"per_page": per_page, "page": p})
+
+    if explicit_page is not None:
+        # Caller asked for one specific page — honour it exactly (old behaviour).
+        data = await _fetch_page(explicit_page)
+        items = data.get("_embedded", {}).get("pipelines", [])
+        complete = None
+    else:
+        # Default: walk every page until we have collected `total` records.
+        first = await _fetch_page(1)
+        items = list(first.get("_embedded", {}).get("pipelines", []))
+        total = first.get("total")
+        data = first
+
+        # Keep fetching pages until we have everyone. Guard with a hard page
+        # ceiling so a bad `total` can never cause an unbounded loop.
+        page = 2
+        max_pages = 100  # 100 pages * 100/page = 10,000 candidates
+        while isinstance(total, int) and len(items) < total and page <= max_pages:
+            nxt = await _fetch_page(page)
+            batch = nxt.get("_embedded", {}).get("pipelines", [])
+            if not batch:
+                break  # no more data even though total said otherwise — stop
+            items.extend(batch)
+            page += 1
+
+        # Dedupe by pipeline id, just in case a record straddled a page boundary.
+        seen = set()
+        deduped = []
+        for it in items:
+            pid = it.get("id")
+            if pid in seen:
+                continue
+            seen.add(pid)
+            deduped.append(it)
+        items = deduped
+
+        # Completeness flag: did we actually collect everyone CATS says exists?
+        complete = (len(items) == total) if isinstance(total, int) else None
 
     workflow_ids = {item.get("workflow_id") for item in items if item.get("workflow_id")}
     status_map = {}
@@ -330,7 +382,18 @@ async def tool_list_pipeline_candidates(args: dict):
         items = _since_filter(items, since)
         data["filtered_since"] = since
 
+    data.setdefault("_embedded", {})
     data["_embedded"]["pipelines"] = items
+    data["returned"] = len(items)
+    if explicit_page is None:
+        # Make completeness explicit and impossible to miss.
+        data["complete"] = complete
+        if complete is False:
+            data["warning"] = (
+                "INCOMPLETE: collected %d of %s pipeline records — do NOT treat this "
+                "as the full pipeline. Retry, or narrow with `since`."
+                % (len(items), data.get("total"))
+            )
     return data
 
 

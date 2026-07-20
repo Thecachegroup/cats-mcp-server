@@ -95,6 +95,17 @@ if not PUBLIC_BASE_URL:
 # How long a signed download link stays valid.
 FILE_LINK_TTL_SECONDS = 600
 
+# v3.4: Adobe PDF Services. Conversion is submitted and polled as two separate
+# tool calls so each Vercel invocation finishes well inside the Hobby plan's
+# 10-second function timeout. Adobe holds all job state, so nothing needs
+# storing between invocations.
+ADOBE_BASE = "https://pdf-services.adobe.io"
+PDF_SERVICES_CLIENT_ID = os.environ.get("PDF_SERVICES_CLIENT_ID", "")
+PDF_SERVICES_CLIENT_SECRET = os.environ.get("PDF_SERVICES_CLIENT_SECRET", "")
+
+# Export targets Adobe supports from PDF.
+ADOBE_EXPORT_FORMATS = ["docx", "doc", "pptx", "xlsx", "rtf"]
+
 app = FastAPI()
 
 
@@ -198,6 +209,73 @@ async def cats_post_multipart(path: str, filename: str, content: bytes, extra: d
             return resp.json()
         except Exception:
             return {"uploaded": True}
+
+
+# ---------------------------------------------------------------------------
+# v3.4: Adobe PDF Services helpers
+# ---------------------------------------------------------------------------
+
+def _adobe_creds_check():
+    if not PDF_SERVICES_CLIENT_ID or not PDF_SERVICES_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF_SERVICES_CLIENT_ID / PDF_SERVICES_CLIENT_SECRET not "
+                   "configured on the server. Add both in Vercel and redeploy.",
+        )
+
+
+async def adobe_token(client: httpx.AsyncClient) -> str:
+    """Exchange client credentials for a bearer token. Tokens last ~24h but
+    are cheap to mint, so we get a fresh one per invocation rather than trying
+    to cache across stateless serverless calls."""
+    _adobe_creds_check()
+    resp = await client.post(
+        f"{ADOBE_BASE}/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "client_id": PDF_SERVICES_CLIENT_ID,
+            "client_secret": PDF_SERVICES_CLIENT_SECRET,
+        },
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code,
+                            detail=f"Adobe token request failed: {resp.text[:300]}")
+    return resp.json()["access_token"]
+
+
+def adobe_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "x-api-key": PDF_SERVICES_CLIENT_ID,
+        "Content-Type": "application/json",
+    }
+
+
+async def adobe_upload(client: httpx.AsyncClient, token: str,
+                       content: bytes, media_type: str) -> str:
+    """Two-step upload: ask Adobe for a pre-signed S3 URI, then PUT the bytes
+    straight to S3. Returns the assetID used to create the job."""
+    resp = await client.post(
+        f"{ADOBE_BASE}/assets",
+        headers=adobe_headers(token),
+        json={"mediaType": media_type},
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code,
+                            detail=f"Adobe asset presign failed: {resp.text[:300]}")
+    data = resp.json()
+    upload_uri = data["uploadUri"]
+    asset_id = data["assetID"]
+
+    put = await client.put(
+        upload_uri,
+        headers={"Content-Type": media_type},
+        content=content,
+    )
+    if put.status_code >= 400:
+        raise HTTPException(status_code=put.status_code,
+                            detail=f"Adobe asset upload failed: {put.text[:300]}")
+    return asset_id
 
 
 def auto_shape(result):
@@ -545,6 +623,119 @@ async def tool_download_attachment(args: dict):
         "content_type": content_type,
         "size_bytes": size_bytes,
         "content_base64": base64.b64encode(content).decode("ascii"),
+    }
+
+
+async def tool_convert_attachment(args: dict):
+    """v3.4: submit a CATS attachment to Adobe PDF Services for conversion and
+    return immediately with a job id.
+
+    ASYNC BY DESIGN. Adobe conversions take 15-30s; Vercel Hobby kills any
+    function at 10s. Submitting and polling as two separate tool calls keeps
+    both well inside that limit, so no paid plan is needed. Adobe holds the
+    job state, so nothing is stored server-side between the two calls.
+
+    Follow this with get_conversion_result using the returned job_url.
+    """
+    attachment_id = args["attachment_id"]
+    target_format = (args.get("target_format") or "docx").lower()
+    if target_format not in ADOBE_EXPORT_FORMATS:
+        return {
+            "error": f"Unsupported target_format '{target_format}'.",
+            "supported": ADOBE_EXPORT_FORMATS,
+        }
+
+    _adobe_creds_check()
+
+    meta = await cats_get(f"/attachments/{attachment_id}")
+    filename = meta.get("filename") or f"attachment-{attachment_id}"
+    if not filename.lower().endswith(".pdf"):
+        return {
+            "error": "Adobe export only accepts a PDF as input.",
+            "attachment_id": attachment_id,
+            "filename": filename,
+            "note": "This attachment is not a PDF. If it is already a Word file, "
+                    "use download_attachment and work on it directly.",
+        }
+
+    content, _ = await cats_get_binary(f"/attachments/{attachment_id}/download")
+
+    async with httpx.AsyncClient(timeout=8) as client:
+        token = await adobe_token(client)
+        asset_id = await adobe_upload(client, token, content, "application/pdf")
+
+        resp = await client.post(
+            f"{ADOBE_BASE}/operation/exportpdf",
+            headers=adobe_headers(token),
+            json={"assetID": asset_id, "targetFormat": target_format},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code,
+                                detail=f"Adobe export submit failed: {resp.text[:300]}")
+        job_url = resp.headers.get("location")
+
+    if not job_url:
+        return {
+            "error": "Adobe accepted the job but returned no polling location.",
+            "status_code": resp.status_code,
+        }
+
+    out_name = filename.rsplit(".", 1)[0] + "." + target_format
+    return {
+        "submitted": True,
+        "attachment_id": attachment_id,
+        "source_filename": filename,
+        "target_format": target_format,
+        "suggested_filename": out_name,
+        "job_url": job_url,
+        "note": "Conversion is running at Adobe. Call get_conversion_result with "
+                "this job_url in about 15 seconds. Repeat if still in progress.",
+    }
+
+
+async def tool_get_conversion_result(args: dict):
+    """v3.4: poll an Adobe conversion job.
+
+    Returns status 'in progress', 'done' or 'failed'. When done, returns
+    Adobe's pre-signed download_url — fetch it with curl straight to disk.
+    The URL points at Adobe's S3, so the converted file never passes through
+    this connector or the conversation.
+    """
+    job_url = args["job_url"]
+    if not job_url.startswith(f"{ADOBE_BASE}/"):
+        return {"error": "job_url is not an Adobe PDF Services URL.", "job_url": job_url}
+
+    _adobe_creds_check()
+
+    async with httpx.AsyncClient(timeout=8) as client:
+        token = await adobe_token(client)
+        resp = await client.get(job_url, headers=adobe_headers(token))
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code,
+                                detail=f"Adobe job status failed: {resp.text[:300]}")
+        data = resp.json()
+
+    status = data.get("status")
+    if status == "done":
+        asset = data.get("asset") or {}
+        return {
+            "status": "done",
+            "download_url": asset.get("downloadUri"),
+            "size_bytes": asset.get("size"),
+            "note": "Fetch with curl -L -o <filename> '<download_url>'. "
+                    "Do not read the bytes into the conversation. Link is short-lived.",
+        }
+    if status == "failed":
+        return {
+            "status": "failed",
+            "error": data.get("error"),
+            "note": "Common causes: the PDF is image-only with no text layer, "
+                    "is password protected, or exceeds Adobe's size limits.",
+        }
+    return {
+        "status": status or "in progress",
+        "job_url": job_url,
+        "note": "Not finished. Wait ~10 seconds and call get_conversion_result again.",
     }
 
 
@@ -1732,6 +1923,30 @@ async def tool_get_job_applications(args: dict):
 
 
 TOOLS = {
+    # ---- v3.4: Adobe PDF conversion (async, two-call pattern) ----
+    "convert_attachment": {
+        "description": "Convert a CATS PDF attachment to Word (docx) or another format using Adobe PDF Services, preserving layout, tables and headings. Returns a job_url immediately — conversion runs at Adobe and takes 15-30 seconds. Follow up with get_conversion_result using that job_url. Input must be a PDF. Credentials live on the server, so nothing needs pasting in. Use this instead of extracting text and rebuilding, which loses all formatting.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "integer", "description": "CATS attachment id, from get_candidate_resume."},
+                "target_format": {"type": "string", "enum": ADOBE_EXPORT_FORMATS, "default": "docx", "description": "Output format. docx for an editable Word CV."},
+            },
+            "required": ["attachment_id"],
+        },
+        "handler": tool_convert_attachment,
+    },
+    "get_conversion_result": {
+        "description": "Poll an Adobe conversion job started by convert_attachment. Pass the job_url it returned. Returns status 'in progress' (wait ~10s and call again), 'done' (with a download_url to fetch with curl), or 'failed' (with the reason). Never read the converted file's bytes into the conversation — fetch the download_url directly to disk.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_url": {"type": "string", "description": "The job_url returned by convert_attachment."},
+            },
+            "required": ["job_url"],
+        },
+        "handler": tool_get_conversion_result,
+    },
     "download_attachment": {
         "description": "Get a CATS attachment as a short-lived signed download link (NOT the file contents). Returns filename, size and a fetch_url valid for 10 minutes. Fetch the bytes out-of-band with curl — e.g. curl -L -o cv.pdf '<fetch_url>' — then work on the local file. Never read the fetched bytes back into the conversation. Use this when a CV needs converting, reformatting, or merging with a cover sheet. For reading a CV's text, use read_resume instead. Get attachment_id from get_candidate_resume. Set inline: true ONLY if a signed link cannot be used; that returns base64 through the conversation and is expensive.",
         "inputSchema": {
@@ -2402,7 +2617,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": "3.3.0"},
+            "serverInfo": {"name": "cats-connector", "version": "3.4.0"},
         }))
 
     if method == "tools/list":

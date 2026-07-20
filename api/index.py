@@ -100,6 +100,17 @@ FILE_LINK_TTL_SECONDS = 600
 # 10-second function timeout. Adobe holds all job state, so nothing needs
 # storing between invocations.
 ADOBE_BASE = "https://pdf-services.adobe.io"
+
+# v3.4.1: Adobe returns the polling location on a REGIONAL host
+# (pdf-services-ue1 for US East, pdf-services-ew1 for Europe), not the generic
+# pdf-services.adobe.io used for submission. Validating the returned job_url
+# against ADOBE_BASE alone rejected every real job. Allow-list the hosts
+# instead — still an SSRF guard, but one that matches Adobe's actual behaviour.
+ADOBE_ALLOWED_HOSTS = {
+    "pdf-services.adobe.io",
+    "pdf-services-ue1.adobe.io",
+    "pdf-services-ew1.adobe.io",
+}
 PDF_SERVICES_CLIENT_ID = os.environ.get("PDF_SERVICES_CLIENT_ID", "")
 PDF_SERVICES_CLIENT_SECRET = os.environ.get("PDF_SERVICES_CLIENT_SECRET", "")
 
@@ -702,8 +713,17 @@ async def tool_get_conversion_result(args: dict):
     this connector or the conversation.
     """
     job_url = args["job_url"]
-    if not job_url.startswith(f"{ADOBE_BASE}/"):
-        return {"error": "job_url is not an Adobe PDF Services URL.", "job_url": job_url}
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(job_url)
+    except Exception:
+        return {"error": "job_url could not be parsed as a URL.", "job_url": job_url}
+    if parsed.scheme != "https" or parsed.hostname not in ADOBE_ALLOWED_HOSTS:
+        return {
+            "error": "job_url is not an Adobe PDF Services URL.",
+            "job_url": job_url,
+            "allowed_hosts": sorted(ADOBE_ALLOWED_HOSTS),
+        }
 
     _adobe_creds_check()
 
@@ -717,11 +737,29 @@ async def tool_get_conversion_result(args: dict):
 
     status = data.get("status")
     if status == "done":
+        # Adobe has returned the download URI at the top level, nested under
+        # "asset", and (in its own docs) misspelt as "dowloadUri". Check every
+        # variant rather than assume one shape.
         asset = data.get("asset") or {}
+        download_url = (
+            data.get("downloadUri")
+            or data.get("dowloadUri")
+            or asset.get("downloadUri")
+            or asset.get("dowloadUri")
+        )
+        size = data.get("size") or asset.get("size")
+        if not download_url:
+            return {
+                "status": "done",
+                "error": "Adobe reported the job done but returned no download URI.",
+                "raw_keys": sorted(data.keys()),
+                "note": "Response shape was unexpected — the raw keys are listed so "
+                        "the connector can be corrected.",
+            }
         return {
             "status": "done",
-            "download_url": asset.get("downloadUri"),
-            "size_bytes": asset.get("size"),
+            "download_url": download_url,
+            "size_bytes": size,
             "note": "Fetch with curl -L -o <filename> '<download_url>'. "
                     "Do not read the bytes into the conversation. Link is short-lived.",
         }
@@ -2617,7 +2655,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": "3.4.0"},
+            "serverInfo": {"name": "cats-connector", "version": "3.4.1"},
         }))
 
     if method == "tools/list":

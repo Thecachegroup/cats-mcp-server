@@ -70,15 +70,30 @@ CATS API facts worth keeping:
 import os
 import io
 import json
+import hmac
+import hashlib
+import time
 from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 CATS_API_BASE = "https://api.catsone.com/v3"
 CATS_API_KEY = os.environ.get("CATS_API_KEY", "")
 CONNECTOR_SHARED_KEY = os.environ.get("CONNECTOR_SHARED_KEY", "")
+
+# v3.3: public base URL of this Vercel deployment, used to build signed
+# file-relay links. Vercel sets VERCEL_URL automatically (no scheme), but a
+# custom domain should be set explicitly via PUBLIC_BASE_URL.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+if not PUBLIC_BASE_URL:
+    _vercel_url = os.environ.get("VERCEL_URL", "")
+    if _vercel_url:
+        PUBLIC_BASE_URL = f"https://{_vercel_url}"
+
+# How long a signed download link stays valid.
+FILE_LINK_TTL_SECONDS = 600
 
 app = FastAPI()
 
@@ -133,6 +148,32 @@ async def cats_get_binary(path: str):
             raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
         return resp.content, resp.headers.get("content-type", "")
 
+
+
+def _file_token(attachment_id: int, expires: int) -> str:
+    """v3.3: HMAC signature binding a download link to one attachment id and
+    one expiry time. Signed with CONNECTOR_SHARED_KEY, which already lives in
+    Vercel's env — so no new secret is needed and the CATS API key never
+    leaves the server. A leaked link expires and exposes exactly one file."""
+    if not CONNECTOR_SHARED_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="CONNECTOR_SHARED_KEY not configured — cannot sign file links.",
+        )
+    msg = f"{attachment_id}:{expires}".encode("utf-8")
+    return hmac.new(
+        CONNECTOR_SHARED_KEY.encode("utf-8"), msg, hashlib.sha256
+    ).hexdigest()
+
+
+def _file_token_valid(attachment_id: int, expires: int, token: str) -> bool:
+    if expires < int(time.time()):
+        return False
+    try:
+        expected = _file_token(attachment_id, expires)
+    except HTTPException:
+        return False
+    return hmac.compare_digest(expected, token or "")
 
 
 async def cats_delete(path: str, body: dict | None = None):
@@ -429,39 +470,77 @@ async def tool_read_resume(args: dict):
 
 
 async def tool_download_attachment(args: dict):
-    """Return a CATS attachment as base64 — the reverse of
-    upload_candidate_attachment. read_resume only returns extracted text;
-    this returns the actual file bytes, so a CV can be converted, reformatted
-    or merged with a cover sheet without being downloaded by hand.
+    """Return a short-lived signed download link for a CATS attachment.
 
-    Read-only, so no confirm gate. Size-capped: base64 inflates by ~33% and
-    the result travels through the conversation, so anything oversized is
-    refused with a clear message rather than silently blowing the context.
+    v3.3 CHANGE — this used to return the file base64-encoded, which put the
+    whole file through the conversation. A single CV cost tens of thousands of
+    tokens and two downloads could exhaust the context window. It now returns
+    metadata plus a signed URL (~200 tokens); the caller fetches the bytes
+    out-of-band with curl/wget and never pays context for the payload.
+
+    The link is HMAC-signed, bound to one attachment id, and expires after
+    FILE_LINK_TTL_SECONDS. The CATS API key stays server-side.
+
+    inline: true restores the old base64 behaviour for small files only — use
+    it deliberately, not by habit. read_resume remains the right tool when only
+    the text is needed.
     """
     import base64
 
     attachment_id = args["attachment_id"]
+    inline = bool(args.get("inline", False))
+
+    meta = await cats_get(f"/attachments/{attachment_id}")
+    filename = meta.get("filename")
+
+    if not inline:
+        if not PUBLIC_BASE_URL:
+            return {
+                "error": "No public base URL configured, so a download link cannot be built.",
+                "note": "Set PUBLIC_BASE_URL in Vercel (e.g. https://your-app.vercel.app), "
+                        "or call again with inline: true to fall back to base64.",
+                "attachment_id": attachment_id,
+                "filename": filename,
+            }
+        expires = int(time.time()) + FILE_LINK_TTL_SECONDS
+        token = _file_token(attachment_id, expires)
+        url = (
+            f"{PUBLIC_BASE_URL}/api/file/{attachment_id}"
+            f"?expires={expires}&token={token}"
+        )
+        return {
+            "attachment_id": attachment_id,
+            "filename": filename,
+            "is_resume": meta.get("is_resume"),
+            "size_bytes": meta.get("size"),
+            "fetch_url": url,
+            "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat(),
+            "expires_in_seconds": FILE_LINK_TTL_SECONDS,
+            "note": "Fetch this URL directly (curl -L -o <filename> '<fetch_url>'). "
+                    "Do not read the bytes into the conversation.",
+        }
+
+    # --- inline fallback: base64 through the conversation, size-capped ---
     max_mb = args.get("max_mb", 4)
     max_bytes = int(max_mb * 1024 * 1024)
 
-    meta = await cats_get(f"/attachments/{attachment_id}")
     content, content_type = await cats_get_binary(f"/attachments/{attachment_id}/download")
-
     size_bytes = len(content)
     if size_bytes > max_bytes:
         return {
             "error": "File too large to return through the conversation.",
             "attachment_id": attachment_id,
-            "filename": meta.get("filename"),
+            "filename": filename,
             "size_bytes": size_bytes,
             "size_mb": round(size_bytes / 1024 / 1024, 2),
             "max_mb": max_mb,
-            "note": "Raise max_mb if you're sure, or use read_resume for text only.",
+            "note": "Drop inline and use the signed fetch_url instead — it has no size limit "
+                    "and costs no context.",
         }
 
     return {
         "attachment_id": attachment_id,
-        "filename": meta.get("filename"),
+        "filename": filename,
         "is_resume": meta.get("is_resume"),
         "content_type": content_type,
         "size_bytes": size_bytes,
@@ -1654,12 +1733,13 @@ async def tool_get_job_applications(args: dict):
 
 TOOLS = {
     "download_attachment": {
-        "description": "Download a CATS attachment and return it base64-encoded — the actual file, not extracted text. Use this when a CV needs to be converted, reformatted, or merged with a cover sheet. For simply reading a CV's contents, use read_resume instead (much smaller response). Get attachment_id from get_candidate_resume. Refuses files over 4MB by default; raise max_mb to override.",
+        "description": "Get a CATS attachment as a short-lived signed download link (NOT the file contents). Returns filename, size and a fetch_url valid for 10 minutes. Fetch the bytes out-of-band with curl — e.g. curl -L -o cv.pdf '<fetch_url>' — then work on the local file. Never read the fetched bytes back into the conversation. Use this when a CV needs converting, reformatting, or merging with a cover sheet. For reading a CV's text, use read_resume instead. Get attachment_id from get_candidate_resume. Set inline: true ONLY if a signed link cannot be used; that returns base64 through the conversation and is expensive.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "attachment_id": {"type": "integer"},
-                "max_mb": {"type": "number", "default": 4, "description": "Size ceiling in MB before the download is refused."},
+                "inline": {"type": "boolean", "default": False, "description": "Return base64 through the conversation instead of a link. Expensive — avoid unless the signed link path is unavailable."},
+                "max_mb": {"type": "number", "default": 4, "description": "Size ceiling in MB, applies to inline mode only."},
             },
             "required": ["attachment_id"],
         },
@@ -2279,6 +2359,35 @@ def rpc_error(id_, code, message, data=None):
     return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message, **({"data": data} if data is not None else {})}}
 
 
+@app.get("/api/file/{attachment_id}")
+async def file_relay(attachment_id: int, expires: int = 0, token: str = ""):
+    """v3.3: stream a CATS attachment to anyone holding a valid signed link.
+
+    Auth is the HMAC in the query string, not the CATS key — so the link can
+    be handed to curl without exposing any credential. Bound to a single
+    attachment id and expiring after FILE_LINK_TTL_SECONDS.
+    """
+    if not _file_token_valid(attachment_id, expires, token):
+        raise HTTPException(status_code=403, detail="Invalid or expired download link.")
+
+    try:
+        meta = await cats_get(f"/attachments/{attachment_id}")
+        filename = meta.get("filename") or f"attachment-{attachment_id}"
+    except HTTPException:
+        filename = f"attachment-{attachment_id}"
+
+    content, content_type = await cats_get_binary(f"/attachments/{attachment_id}/download")
+    safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    return Response(
+        content=content,
+        media_type=content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @app.post("/api/mcp/{key}")
 async def mcp_endpoint(key: str, request: Request):
     if CONNECTOR_SHARED_KEY and key != CONNECTOR_SHARED_KEY:
@@ -2293,7 +2402,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": "3.2.0"},
+            "serverInfo": {"name": "cats-connector", "version": "3.3.0"},
         }))
 
     if method == "tools/list":

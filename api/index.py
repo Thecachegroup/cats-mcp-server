@@ -428,6 +428,47 @@ async def tool_read_resume(args: dict):
     }
 
 
+async def tool_download_attachment(args: dict):
+    """Return a CATS attachment as base64 — the reverse of
+    upload_candidate_attachment. read_resume only returns extracted text;
+    this returns the actual file bytes, so a CV can be converted, reformatted
+    or merged with a cover sheet without being downloaded by hand.
+
+    Read-only, so no confirm gate. Size-capped: base64 inflates by ~33% and
+    the result travels through the conversation, so anything oversized is
+    refused with a clear message rather than silently blowing the context.
+    """
+    import base64
+
+    attachment_id = args["attachment_id"]
+    max_mb = args.get("max_mb", 4)
+    max_bytes = int(max_mb * 1024 * 1024)
+
+    meta = await cats_get(f"/attachments/{attachment_id}")
+    content, content_type = await cats_get_binary(f"/attachments/{attachment_id}/download")
+
+    size_bytes = len(content)
+    if size_bytes > max_bytes:
+        return {
+            "error": "File too large to return through the conversation.",
+            "attachment_id": attachment_id,
+            "filename": meta.get("filename"),
+            "size_bytes": size_bytes,
+            "size_mb": round(size_bytes / 1024 / 1024, 2),
+            "max_mb": max_mb,
+            "note": "Raise max_mb if you're sure, or use read_resume for text only.",
+        }
+
+    return {
+        "attachment_id": attachment_id,
+        "filename": meta.get("filename"),
+        "is_resume": meta.get("is_resume"),
+        "content_type": content_type,
+        "size_bytes": size_bytes,
+        "content_base64": base64.b64encode(content).decode("ascii"),
+    }
+
+
 async def tool_list_recent_candidates(args: dict):
     per_page = args.get("per_page", 50)
     page = args.get("page", 1)
@@ -1612,6 +1653,18 @@ async def tool_get_job_applications(args: dict):
 
 
 TOOLS = {
+    "download_attachment": {
+        "description": "Download a CATS attachment and return it base64-encoded — the actual file, not extracted text. Use this when a CV needs to be converted, reformatted, or merged with a cover sheet. For simply reading a CV's contents, use read_resume instead (much smaller response). Get attachment_id from get_candidate_resume. Refuses files over 4MB by default; raise max_mb to override.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {"type": "integer"},
+                "max_mb": {"type": "number", "default": 4, "description": "Size ceiling in MB before the download is refused."},
+            },
+            "required": ["attachment_id"],
+        },
+        "handler": tool_download_attachment,
+    },
     # ---- v3.1: candidate email send ----
     "send_candidate_email": {
         "description": "Send a screening question to a candidate by email, sent AS careers@thecachegroup.com.au via Microsoft Graph (CATS itself has no candidate-email send endpoint). Use for the 'one question from a higher rating' workflow: surface the candidates, get Andrew's approval, then send. PREVIEW BY DEFAULT: call without confirm to show exactly what would be sent and to whom. Call again with confirm: true to actually send. On send it also logs a CATS activity on the candidate, leaves the star rating unchanged, and (if pipeline_id is given) moves the candidate to the 'Contacted Pending' pipeline status. send_as is restricted to an allow-list (currently careers@ only).",
@@ -2240,7 +2293,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": "3.1.0"},
+            "serverInfo": {"name": "cats-connector", "version": "3.2.0"},
         }))
 
     if method == "tools/list":

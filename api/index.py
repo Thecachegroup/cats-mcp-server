@@ -372,23 +372,130 @@ async def _fetch_candidates_newest_first(pages: int = 10, per_page: int = 100):
 
 
 
+import re
+import struct
+import html as _html
+
+
+def _tidy_text(text: str) -> str:
+    """Strip Word field codes and control characters, normalise blank lines."""
+    text = re.sub(r"\x13[^\x14\x15]*[\x14\x15]?", "", text)
+    text = re.sub(r'\s*HYPERLINK\s+"[^"]*"\s*', " ", text)
+    text = text.replace("\x15", "")
+    for ch in ("\r", "\x07", "\x0b", "\x0c"):
+        text = text.replace(ch, "\n")
+    text = "".join(c for c in text if c >= " " or c in "\n\t")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _extract_legacy_doc(content: bytes) -> str:
+    """Word 97-2003 binary .doc, read via the piece table. Pure Python."""
+    import olefile
+    ole = olefile.OleFileIO(io.BytesIO(content))
+    if not ole.exists("WordDocument"):
+        raise ValueError("no WordDocument stream")
+    wd = ole.openstream("WordDocument").read()
+    flags = struct.unpack_from("<H", wd, 0x0A)[0]
+    table_name = "1Table" if (flags & 0x0200) else "0Table"
+    if not ole.exists(table_name):
+        table_name = "0Table" if table_name == "1Table" else "1Table"
+    table = ole.openstream(table_name).read()
+    fc_clx, lcb_clx = struct.unpack_from("<II", wd, 0x01A2)
+    clx = table[fc_clx:fc_clx + lcb_clx]
+
+    pcdt, i = None, 0
+    while i < len(clx):
+        if clx[i] == 0x01:
+            i += 3 + struct.unpack_from("<H", clx, i + 1)[0]
+        elif clx[i] == 0x02:
+            lcb = struct.unpack_from("<I", clx, i + 1)[0]
+            pcdt = clx[i + 5:i + 5 + lcb]
+            break
+        else:
+            break
+    if not pcdt:
+        raise ValueError("no piece table in CLX")
+
+    n = (len(pcdt) - 4) // 12
+    cps = struct.unpack_from("<%dI" % (n + 1), pcdt, 0)
+    base = 4 * (n + 1)
+    parts = []
+    for k in range(n):
+        fc = struct.unpack_from("<I", pcdt, base + k * 8 + 2)[0]
+        length = cps[k + 1] - cps[k]
+        if fc & 0x40000000:
+            off = (fc & ~0x40000000) // 2
+            parts.append(wd[off:off + length].decode("cp1252", "ignore"))
+        else:
+            parts.append(wd[fc:fc + length * 2].decode("utf-16-le", "ignore"))
+    return "".join(parts)
+
+
+def _extract_html(content: bytes) -> str:
+    raw = content.decode("utf-8", "ignore")
+    raw = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+    raw = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>", "\n", raw)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    return _html.unescape(raw)
+
+
+def _sniff(content: bytes, lower: str) -> str:
+    """Identify the real format. Extensions lie — plenty of .doc files are RTF
+    or HTML underneath, and SEEK mislabels regularly."""
+    head = content[:8]
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if head.startswith(b"PK\x03\x04"):
+        return "docx"
+    if head.startswith(b"\xd0\xcf\x11\xe0"):
+        return "doc"
+    if content[:5].lstrip().startswith(b"{\\rtf"):
+        return "rtf"
+    sample = content[:2048].lstrip().lower()
+    if sample.startswith(b"<!doctype html") or sample.startswith(b"<html") or b"<body" in sample:
+        return "html"
+    for ext, kind in ((".pdf", "pdf"), (".docx", "docx"), (".doc", "doc"),
+                      (".rtf", "rtf"), (".htm", "html"), (".txt", "txt")):
+        if lower.endswith(ext):
+            return kind
+    return "txt"
+
+
 def extract_text_from_bytes(content: bytes, filename: str) -> str:
-    """Best-effort text extraction for common resume formats."""
+    """Best-effort text extraction for common resume formats.
+
+    Handles PDF, DOCX, legacy binary DOC, RTF, HTML and plain text. Format is
+    detected from the file's magic bytes, falling back to the extension.
+    """
     lower = (filename or "").lower()
+    kind = _sniff(content, lower)
     try:
-        if lower.endswith(".pdf"):
+        if kind == "pdf":
             from pypdf import PdfReader
             reader = PdfReader(io.BytesIO(content))
-            return "\n".join((page.extract_text() or "") for page in reader.pages)
-        if lower.endswith(".docx"):
+            return _tidy_text("\n".join((p.extract_text() or "") for p in reader.pages))
+        if kind == "docx":
             import docx
-            doc = docx.Document(io.BytesIO(content))
-            return "\n".join(p.text for p in doc.paragraphs)
-        if lower.endswith(".txt") or lower.endswith(".rtf"):
-            return content.decode("utf-8", errors="ignore")
+            d = docx.Document(io.BytesIO(content))
+            paras = [p.text for p in d.paragraphs]
+            for tbl in d.tables:
+                for row in tbl.rows:
+                    paras.append("\t".join(c.text for c in row.cells))
+            return _tidy_text("\n".join(paras))
+        if kind == "doc":
+            return _tidy_text(_extract_legacy_doc(content))
+        if kind == "rtf":
+            from striprtf.striprtf import rtf_to_text
+            return _tidy_text(rtf_to_text(content.decode("utf-8", "ignore"), errors="ignore"))
+        if kind == "html":
+            return _tidy_text(_extract_html(content))
+        return _tidy_text(content.decode("utf-8", "ignore"))
     except Exception as e:
-        return f"[Could not extract text from {filename}: {e}]"
-    return f"[Unsupported format for text extraction: {filename}. Use the CATS UI to view this file directly.]"
+        return (f"[Extraction failed for {filename} ({kind}): {type(e).__name__}: {e}. "
+                "Try the other attachments on this candidate record — the cover letter "
+                "often parses when the CV does not. If nothing extracts, this is a tooling "
+                "limit, not an unreadable CV: open the file in the CATS UI.]")
+
 
 
 # ---- Tool implementations ------------------------------------------------
@@ -2655,7 +2762,7 @@ async def mcp_endpoint(key: str, request: Request):
         return JSONResponse(rpc_result(id_, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "cats-connector", "version": "3.4.1"},
+            "serverInfo": {"name": "cats-connector", "version": "3.5.0"},
         }))
 
     if method == "tools/list":

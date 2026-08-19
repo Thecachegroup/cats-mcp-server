@@ -944,8 +944,65 @@ async def tool_get_candidate_pipeline_history(args: dict):
     return data
 
 
+async def _pipeline_snapshot(pipeline_id: int):
+    """Read a pipeline entry so a write can be logged with its before-values.
+    Never raises — a failed snapshot must not block the write itself."""
+    try:
+        return await cats_get(f"/pipelines/{pipeline_id}")
+    except Exception:
+        return None
+
+
+async def _log_pipeline_write(pipeline_id: int, before, rating, status_id, source: str):
+    """Write an audit activity for ANY rating/status change this connector makes.
+
+    CATS records no author on the pipeline object and does not log rating
+    changes at all, so a write made through the API is otherwise invisible —
+    there is no way afterwards to tell who changed what, or from what. This
+    closes that hole: every write leaves a dated, attributable trail.
+
+    Never raises. An audit failure must not mask or roll back the write.
+    """
+    try:
+        cid = (before or {}).get("candidate_id")
+        if cid is None:
+            entry = await _pipeline_snapshot(pipeline_id)
+            cid = (entry or {}).get("candidate_id")
+        if cid is None:
+            return
+
+        parts = []
+        if rating is not None:
+            was = (before or {}).get("rating")
+            parts.append(f"rating {was if was is not None else '?'} -> {rating}")
+        if status_id is not None:
+            was = (before or {}).get("status_id")
+            parts.append(f"status_id {was if was is not None else '?'} -> {status_id}")
+        if not parts:
+            return
+
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        await cats_post(
+            f"/candidates/{cid}/activities",
+            {
+                "type": "other",
+                "notes": (
+                    f"[CONNECTOR WRITE {stamp}] {source} on pipeline {pipeline_id}: "
+                    + "; ".join(parts)
+                ),
+            },
+        )
+    except Exception:
+        return
+
+
 async def tool_update_pipeline_rating_status(args: dict):
-    """Set rating and/or status on a single pipeline entry."""
+    """Set rating and/or status on a single pipeline entry.
+
+    This is the ONLY tool that may set a rating. A rating is a per-candidate
+    judgement and must be written one candidate at a time, against that
+    candidate's own evidence. Every write is logged as an activity.
+    """
     pipeline_id = args["pipeline_id"]
     rating = args.get("rating")
     status_id = args.get("status_id")
@@ -960,20 +1017,59 @@ async def tool_update_pipeline_rating_status(args: dict):
             "note": "Nothing has changed yet. Call again with confirm: true to actually apply this in CATS.",
         }
 
+    before = await _pipeline_snapshot(pipeline_id)
+
     results = {}
     if rating is not None:
         results["rating_update"] = await cats_put(f"/pipelines/{pipeline_id}", {"rating": rating})
     if status_id is not None:
         results["status_update"] = await cats_post(f"/pipelines/{pipeline_id}/status", {"status_id": status_id})
-    return {"changed": True, "action": "update_pipeline_rating_status", "pipeline_id": pipeline_id, "results": results}
+
+    await _log_pipeline_write(pipeline_id, before, rating, status_id, "update_pipeline_rating_status")
+
+    return {
+        "changed": True,
+        "action": "update_pipeline_rating_status",
+        "pipeline_id": pipeline_id,
+        "results": results,
+        "audit_logged": True,
+    }
+
+
+BULK_RATING_REFUSAL = (
+    "bulk_update_pipelines cannot set ratings, by design. A rating is a "
+    "per-candidate judgement; this tool applies ONE value to EVERY entry in "
+    "the batch, so passing a rating silently overwrites each candidate's "
+    "individual assessment with a single number. On 2026-08-04 this flattened "
+    "13 assessed candidates on a live role into two uniform blocks (9 x 3 star, "
+    "4 x 2 star), un-rejecting nine people who had been screened out, and they "
+    "were subsequently contacted. "
+    "Use update_pipeline_rating_status once per candidate instead, after "
+    "logging the reason with create_candidate_activity. "
+    "Bulk STATUS changes are still supported and are the correct use of this "
+    "tool (role close-downs, advancing a stage) — omit the rating parameter."
+)
 
 
 async def tool_bulk_update_pipelines(args: dict):
-    """Set rating and/or status across multiple pipeline entries at once —
-    e.g. 'give all those good candidates Qualifying status and 3 stars'."""
+    """Set STATUS across multiple pipeline entries at once.
+
+    Ratings are deliberately not supported here — see BULK_RATING_REFUSAL.
+    Every status change is logged as an activity against the candidate.
+    """
     pipeline_ids = args["pipeline_ids"]
-    rating = args.get("rating")
     status_id = args.get("status_id")
+
+    # Hard refusal, checked before preview so a preview can never look clean
+    # and then fail (or worse, succeed) on confirm.
+    if args.get("rating") is not None:
+        raise HTTPException(status_code=400, detail=BULK_RATING_REFUSAL)
+
+    if status_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="bulk_update_pipelines requires status_id. Ratings are not supported here.",
+        )
 
     if not args.get("confirm"):
         return {
@@ -981,9 +1077,10 @@ async def tool_bulk_update_pipelines(args: dict):
             "action": "bulk_update_pipelines",
             "pipeline_ids": pipeline_ids,
             "count": len(pipeline_ids),
-            "would_set_rating_to": rating,
             "would_set_status_id_to": status_id,
-            "note": f"Nothing has changed yet. This would update {len(pipeline_ids)} pipeline entries. "
+            "ratings_untouched": True,
+            "note": f"Nothing has changed yet. This would move {len(pipeline_ids)} pipeline entries "
+                    f"to status_id {status_id}. Existing ratings are left exactly as they are. "
                     "Call again with confirm: true to actually apply this in CATS.",
         }
 
@@ -991,17 +1088,22 @@ async def tool_bulk_update_pipelines(args: dict):
     for pid in pipeline_ids:
         entry = {"pipeline_id": pid}
         try:
-            if rating is not None:
-                await cats_put(f"/pipelines/{pid}", {"rating": rating})
-            if status_id is not None:
-                await cats_post(f"/pipelines/{pid}/status", {"status_id": status_id})
+            before = await _pipeline_snapshot(pid)
+            await cats_post(f"/pipelines/{pid}/status", {"status_id": status_id})
+            await _log_pipeline_write(pid, before, None, status_id, "bulk_update_pipelines")
             entry["success"] = True
         except HTTPException as e:
             entry["success"] = False
             entry["error"] = str(e.detail)
         results.append(entry)
 
-    return {"changed": True, "action": "bulk_update_pipelines", "results": results}
+    return {
+        "changed": True,
+        "action": "bulk_update_pipelines",
+        "results": results,
+        "ratings_untouched": True,
+        "audit_logged": True,
+    }
 
 
 async def tool_update_job_notes(args: dict):
@@ -2569,7 +2671,7 @@ TOOLS = {
         "handler": tool_update_job,
     },
     "update_pipeline_rating_status": {
-        "description": "Set the star rating and/or pipeline status on a single candidate's pipeline entry (e.g. set rating to 3 and status to 'Qualifying'). PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually apply. Use get_workflow_statuses first to find the right status_id.",
+        "description": "Set the star rating and/or pipeline status on a SINGLE candidate's pipeline entry (e.g. set rating to 3 and status to 'Qualifying'). This is the ONLY tool that can set a rating — bulk_update_pipelines is status-only by design. Rate one candidate at a time, against that candidate's own evidence, and log the reason with create_candidate_activity BEFORE writing. Every change is logged as an activity. PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually apply. Use get_workflow_statuses first to find the right status_id.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2583,16 +2685,15 @@ TOOLS = {
         "handler": tool_update_pipeline_rating_status,
     },
     "bulk_update_pipelines": {
-        "description": "Set the star rating and/or pipeline status across MULTIPLE candidates' pipeline entries at once — this is the tool for 'give all those good candidates Qualifying status and 3 stars'. PREVIEW BY DEFAULT: call without confirm first to see how many entries would change. Call again with confirm: true to actually apply. Use get_workflow_statuses first to find the right status_id for the target stage.",
+        "description": "Move MULTIPLE candidates to the same pipeline status in one call — for role close-downs and stage advances (e.g. 'move everyone still at Qualifying to Not Proceeding'). STATUS ONLY: this tool CANNOT set ratings and will return an error if you pass one. A rating is a per-candidate judgement and one value applied across a batch overwrites every individual assessment — use update_pipeline_rating_status once per candidate for that, after logging the reason with create_candidate_activity. Existing ratings are left untouched here. Every change is logged as an activity against the candidate. PREVIEW BY DEFAULT: call without confirm first to see how many entries would change. Call again with confirm: true to actually apply. Use get_workflow_statuses first to find the right status_id for the target stage.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "pipeline_ids": {"type": "array", "items": {"type": "integer"}},
-                "rating": {"type": "integer", "description": "Star rating, typically 0-5"},
-                "status_id": {"type": "integer"},
+                "status_id": {"type": "integer", "description": "Target status for every entry in the batch. Required."},
                 "confirm": {"type": "boolean", "default": False},
             },
-            "required": ["pipeline_ids"],
+            "required": ["pipeline_ids", "status_id"],
         },
         "handler": tool_bulk_update_pipelines,
     },

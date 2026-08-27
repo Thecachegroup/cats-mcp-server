@@ -377,6 +377,57 @@ import struct
 import html as _html
 
 
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _docx_para_text(p) -> str:
+    """Every scrap of text in one w:p, in document order.
+
+    Deliberately walks ALL descendants rather than the direct w:r children that
+    python-docx's Paragraph.text reads. Word wraps runs in w:sdt (content
+    controls), w:hyperlink, w:smartTag and w:ins, and python-docx returns "" for
+    every one of them. CV templates use content controls heavily — one real CV
+    had 68, and every employer name, job title and date line sat inside one, so
+    the bullet points survived extraction and the roles they belonged to did not.
+    """
+    parts = []
+    for node in p.iter():
+        tag = node.tag
+        if tag == _W + "t":
+            parts.append(node.text or "")
+        elif tag == _W + "tab":
+            parts.append("\t")
+        elif tag in (_W + "br", _W + "cr"):
+            parts.append("\n")
+    return "".join(parts)
+
+
+def _docx_walk(parent) -> list:
+    """Walk a docx body, table cell or content control in document order.
+
+    Returns a list of text lines. Handles three things the naive read misses:
+      - w:sdt blocks, which can wrap a whole paragraph or table
+      - nested tables, which never appear in Document.tables
+      - merged cells, which python-docx's row.cells repeats once per grid column
+        it spans, duplicating whole blocks of a CV
+    """
+    out = []
+    for child in parent.iterchildren():
+        tag = child.tag
+        if tag == _W + "p":
+            out.append(_docx_para_text(child))
+        elif tag == _W + "tbl":
+            for row in child.iterchildren(_W + "tr"):
+                for tc in row.iterchildren(_W + "tc"):
+                    # each w:tc once. python-docx's row.cells yields a merged
+                    # cell repeatedly, once per grid column it spans.
+                    out.extend(x for x in _docx_walk(tc) if x.strip())
+        elif tag == _W + "sdt":
+            for sdt_content in child.iterchildren(_W + "sdtContent"):
+                out.extend(_docx_walk(sdt_content))
+    return out
+
+
 def _tidy_text(text: str) -> str:
     """Strip Word field codes and control characters, normalise blank lines."""
     text = re.sub(r"\x13[^\x14\x15]*[\x14\x15]?", "", text)
@@ -477,11 +528,7 @@ def extract_text_from_bytes(content: bytes, filename: str) -> str:
         if kind == "docx":
             import docx
             d = docx.Document(io.BytesIO(content))
-            paras = [p.text for p in d.paragraphs]
-            for tbl in d.tables:
-                for row in tbl.rows:
-                    paras.append("\t".join(c.text for c in row.cells))
-            return _tidy_text("\n".join(paras))
+            return _tidy_text("\n".join(_docx_walk(d.element.body)))
         if kind == "doc":
             return _tidy_text(_extract_legacy_doc(content))
         if kind == "rtf":

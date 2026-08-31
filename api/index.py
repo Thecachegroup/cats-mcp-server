@@ -49,6 +49,24 @@ v3 (July 2026) changes — all verified against the live CATS v3 docs:
     This also unblocks never-employ/do-not-contact flag detection: every
     pipeline at a given status_id can now be pulled in one hit.
 
+v3.5 (August 2026) — SEEK cover-letter shell detection and merge:
+  - find_orphan_shells (read-only) and merge_orphan_shells (preview-gated).
+    CATS's resume inbox documents that "Each attachment found will be parsed
+    and treated as a unique candidate", so every SEEK application carrying a
+    cover letter creates a SECOND, empty candidate record. One cause, three
+    symptoms: "Anonymous Candidate", a duplicate under the real name, or a
+    record filed under a name misparsed out of the letter's prose (observed:
+    "At AGL, I led engineering of..." became first_name "At", last_name
+    "AGL"). Measured Aug 2026: 16 of 105 attachments on the Integration
+    Analyst pipelines were cover-letter .txt files.
+    Detection is structural, not fuzzy: a genuine application always carries
+    an "Application for the role of X" activity and a shell never does.
+    Pairing uses the resume that arrived in the same email (adjacent
+    attachment id), confirmed against the same job pipeline.
+    The scan is built for the 500-req/hour limit: /jobs/{id}/pipelines already
+    embeds the whole candidate object, so the first pass costs one call per
+    100 candidates and zero per candidate.
+
 Endpoints still inferred rather than confirmed — flagged in their own
 descriptions/responses:
   change_pipeline_status, search_contacts.
@@ -2216,6 +2234,565 @@ async def tool_get_job_applications(args: dict):
     return await cats_get(f"/jobs/{job_id}/applications", {"per_page": per_page, "page": page})
 
 
+
+# ===========================================================================
+# v3.5: SEEK cover-letter shell detection and merge
+# ===========================================================================
+# THE PROBLEM
+#   TCG receives SEEK applications by email into the CATS resume inbox. CATS
+#   documents its own behaviour plainly: "Each attachment found will be parsed
+#   and treated as a unique candidate." A SEEK application carries the resume
+#   AND the cover letter as separate files, so every application with a cover
+#   letter creates TWO candidate records:
+#     - the real one, parsed from the resume (email, phones, work history)
+#     - a SHELL, parsed from the cover letter (no email, no work history)
+#
+#   CATS runs its CV parser over the cover-letter .txt and names the shell from
+#   whatever that parse yields, which produces three different-looking symptoms
+#   from one single cause:
+#     - nothing extracted   -> "Anonymous Candidate"
+#     - correct name        -> a duplicate row under the person's real name
+#     - WRONG name          -> filed under something else entirely. Observed
+#                              live: a letter reading "At AGL, I led engineering
+#                              of ..." produced first_name "At", last_name
+#                              "AGL". Those are the dangerous ones: they do not
+#                              look like duplicates, so nobody spots them.
+#
+#   Measured on the Integration Analyst pipelines, Aug 2026: 16 of 105
+#   attachments were cover-letter .txt files, producing roughly one shell for
+#   every seven real candidates. Shells have no email address, so a role
+#   closedown addressed to one silently sends to nobody.
+#
+# WHY DETECTION IS RELIABLE
+#   This is not name-matching or fuzzy guesswork. There is a structural
+#   discriminator in the activity record:
+#     - a genuine application ALWAYS gets an activity annotated
+#       "Application for the role of <X>"
+#     - a shell NEVER does. It carries only "Added candidate to pipeline"
+#       with entered_by_id 0.
+#   Verified against 8 shells and 5 real records with no exceptions.
+#
+#   Do NOT detect on emptiness alone. One observed shell had a title, an
+#   employer and a full work_history entry, all parsed straight out of the
+#   prose of the cover letter. Emptiness is a cheap pre-filter, never the test.
+#
+# WHY THERE IS NO "MERGE"
+#   The CATS v3 API has no merge endpoint. It does not need one here: the shell
+#   contains nothing but the cover letter, so copying that one attachment onto
+#   the real record and disposing of the shell IS the merge, and is safer than
+#   a true merge because there are no competing fields to reconcile.
+#
+# CALL BUDGET
+#   CATS allows 500 requests/hour, rolling. This scan is built around that:
+#   /jobs/{id}/pipelines already embeds the whole candidate object, so the
+#   first pass costs ONE call per 100 candidates and zero calls per candidate.
+#   Only records that fail the cheap no-email pre-filter cost further calls.
+#   A 300-candidate pipeline typically costs ~3 + (suspects x 3) requests.
+
+# CATS's own fallback surname when its parser extracts no usable surname.
+# NOTE: it appears on real records too (a SEEK applicant whose surname is
+# literally "." was stored as "<First> Candidate"), so this is a hint for the
+# human reading the preview, never a test.
+CATS_NO_NAME_SURNAME = "candidate"
+
+# Marker CATS writes on the activity of a genuine application.
+APPLICATION_ACTIVITY_MARKER = "application for the role"
+
+# Filename shapes CATS gives a SEEK cover letter, e.g.
+# "Prashanth K CATS 16838338 CoverLetter.txt"
+_COVERLETTER_RE = re.compile(r"cover\s*letter", re.IGNORECASE)
+
+# How far past the cover letter's attachment id to look for its resume sibling.
+# Observed live: the two arrive in the same inbound email seconds apart and are
+# allocated consecutive ids (n, n+1), occasionally n+2 where a third file rode
+# along. Kept deliberately tight — a wide window would start pairing strangers.
+_SIBLING_WINDOW = 3
+
+# Pipeline status used to park a shell rather than delete it. This is TCG's
+# existing "CV Unreadable" status and is the DEFAULT disposition, because
+# parking is reversible and DELETE /candidates/{id} is not.
+SHELL_PARK_STATUS_ID = 6453057
+
+
+def _looks_like_cover_letter(filename: str) -> bool:
+    """True for a filename CATS would have given a SEEK cover letter."""
+    name = (filename or "").strip()
+    if not name:
+        return False
+    if _COVERLETTER_RE.search(name):
+        return True
+    # A lone .txt on a candidate with no email is the same animal even when
+    # the filename convention differs (older records, forwarded applications).
+    return name.lower().endswith(".txt")
+
+
+def _has_email(candidate: dict) -> bool:
+    emails = candidate.get("emails") or {}
+    if isinstance(emails, dict):
+        return bool(emails.get("primary") or emails.get("secondary"))
+    if isinstance(emails, list):
+        return any(bool(e) for e in emails)
+    return False
+
+
+def _name_of(candidate: dict) -> str:
+    return " ".join(
+        p for p in [candidate.get("first_name"), candidate.get("last_name")] if p
+    ).strip()
+
+
+def _filename_stem_name(filename: str) -> str:
+    """Pull the person's name off the front of a CATS attachment filename.
+
+    'Nidhi Chowdary  Gadde CATS 16838338 CoverLetter.txt' -> 'nidhi chowdary gadde'
+    Returns '' when the filename does not follow the convention.
+    """
+    if not filename:
+        return ""
+    head = re.split(r"\bCATS\b", filename, maxsplit=1)[0]
+    head = re.sub(r"[._]+", " ", head)
+    head = re.sub(r"\s+", " ", head).strip().lower()
+    return head
+
+
+def _norm_name(value: str) -> str:
+    return re.sub(r"[^a-z ]+", "", re.sub(r"\s+", " ", (value or "").lower())).strip()
+
+
+async def _pipeline_candidates_embedded(job_id: int, max_pages: int = 100):
+    """Every pipeline entry on a job WITH its embedded candidate object.
+
+    Uses the fact that /jobs/{id}/pipelines embeds the full candidate, so a
+    whole pipeline costs one call per 100 records instead of one per person.
+    Returns a list of (pipeline_record, candidate_record) tuples.
+    """
+    out = []
+    page = 1
+    total = None
+    while page <= max_pages:
+        data = await cats_get(f"/jobs/{job_id}/pipelines", {"per_page": 100, "page": page})
+        batch = data.get("_embedded", {}).get("pipelines", [])
+        if not batch:
+            break
+        if total is None:
+            total = data.get("total")
+        for entry in batch:
+            cand = (entry.get("_embedded") or {}).get("candidate") or {}
+            out.append((entry, cand))
+        if isinstance(total, int) and len(out) >= total:
+            break
+        page += 1
+
+    # Dedupe on pipeline id in case a record straddled a page boundary.
+    seen = set()
+    deduped = []
+    for entry, cand in out:
+        pid = entry.get("id")
+        if pid in seen:
+            continue
+        seen.add(pid)
+        deduped.append((entry, cand))
+    return deduped, total
+
+
+async def _is_genuine_application(candidate_id: int) -> bool:
+    """The definitive test. A real application carries an activity annotated
+    'Application for the role of <X>'; a shell never does."""
+    try:
+        data = await cats_get(
+            f"/candidates/{candidate_id}/activities", {"per_page": 50}
+        )
+    except HTTPException:
+        # Cannot prove it is a shell -> treat it as real. Failing safe here
+        # means we skip a shell, never that we touch a real candidate.
+        return True
+    for act in data.get("_embedded", {}).get("activities", []):
+        notes = (act.get("notes") or "").lower()
+        if APPLICATION_ACTIVITY_MARKER in notes:
+            return True
+    return False
+
+
+async def _find_sibling_parent(cover_attachment_id: int, shell_id: int,
+                               pipeline_index: dict):
+    """Locate the real candidate this cover letter belongs to.
+
+    Primary signal: the resume arrived in the same email and holds an
+    attachment id within a few of the cover letter's. Reading that attachment
+    gives data_item -> the candidate that owns it.
+
+    The match is only accepted when that candidate is ALSO on this job's
+    pipeline, which is what stops an adjacent id from an unrelated inbound
+    email being paired to the wrong person.
+    """
+    for offset in range(1, _SIBLING_WINDOW + 1):
+        sibling_id = cover_attachment_id + offset
+        try:
+            meta = await cats_get(f"/attachments/{sibling_id}")
+        except HTTPException:
+            continue
+        owner = (meta.get("data_item") or {})
+        if owner.get("type") not in (None, "candidate"):
+            continue
+        owner_id = owner.get("id")
+        if not owner_id:
+            # Some responses may omit data_item on a direct attachment GET.
+            # Fall back to the sibling's OWN filename, which names the person
+            # properly ("Prashanth K CATS 16838338 Resume.doc") even when the
+            # shell's CATS record name is garbage ("At AGL", "Anonymous").
+            by_name = _find_name_parent(meta.get("filename"), shell_id, pipeline_index)
+            if by_name:
+                by_name["match_reason"] = (
+                    f"sibling attachment {sibling_id} "
+                    f"('{meta.get('filename')}') arrived in the same application; "
+                    f"its filename names a populated candidate on this pipeline"
+                )
+                by_name["sibling_attachment_id"] = sibling_id
+                by_name["sibling_filename"] = meta.get("filename")
+                return by_name
+            continue
+        if owner_id == shell_id:
+            continue
+        if owner_id not in pipeline_index:
+            continue
+        return {
+            "parent_candidate_id": owner_id,
+            "parent_name": _name_of(pipeline_index[owner_id]["candidate"]),
+            "match_confidence": "high",
+            "match_reason": (
+                f"resume attachment {sibling_id} arrived in the same application "
+                f"(cover letter {cover_attachment_id}) and belongs to a candidate "
+                f"on this pipeline"
+            ),
+            "sibling_attachment_id": sibling_id,
+            "sibling_filename": meta.get("filename"),
+        }
+    return None
+
+
+def _find_name_parent(cover_filename: str, shell_id: int, pipeline_index: dict):
+    """Fallback: match the name on the front of the filename to someone on the
+    pipeline. Weaker than the sibling test — reported as medium confidence and
+    never auto-merged without a human looking at the preview."""
+    stem = _norm_name(_filename_stem_name(cover_filename))
+    if not stem or len(stem.split()) < 2:
+        return None
+    for cid, rec in pipeline_index.items():
+        if cid == shell_id:
+            continue
+        cand = rec["candidate"]
+        if not _has_email(cand):
+            continue  # another shell, not a parent
+        if _norm_name(_name_of(cand)) == stem:
+            return {
+                "parent_candidate_id": cid,
+                "parent_name": _name_of(cand),
+                "match_confidence": "medium",
+                "match_reason": (
+                    f"attachment filename names '{stem}', which matches a "
+                    f"populated candidate on this pipeline"
+                ),
+                "sibling_attachment_id": None,
+                "sibling_filename": None,
+            }
+    return None
+
+
+async def _scan_orphan_shells(job_id: int, strict: bool = True,
+                              max_shells: int = 60):
+    """One pass over a job's pipeline returning every cover-letter shell found,
+    each with its proposed parent. Read-only."""
+    entries, total = await _pipeline_candidates_embedded(job_id)
+
+    pipeline_index = {
+        cand.get("id"): {"pipeline": entry, "candidate": cand}
+        for entry, cand in entries
+        if cand.get("id")
+    }
+
+    # Cheap pre-filter: no email address at all. Costs nothing extra because
+    # the pipeline call already embedded it.
+    suspects = [
+        (entry, cand) for entry, cand in entries
+        if cand.get("id") and not _has_email(cand)
+    ]
+
+    shells = []
+    unmatched = []
+    checked = 0
+
+    for entry, cand in suspects:
+        if len(shells) + len(unmatched) >= max_shells:
+            break
+        cid = cand["id"]
+        checked += 1
+
+        try:
+            att = await cats_get(f"/candidates/{cid}/attachments", {"per_page": 100})
+        except HTTPException:
+            continue
+        attachments = att.get("_embedded", {}).get("attachments", [])
+
+        # A shell holds exactly ONE attachment and it is a cover letter.
+        # Anything else is a real candidate who happens to have no email.
+        if len(attachments) != 1:
+            continue
+        cover = attachments[0]
+        if not _looks_like_cover_letter(cover.get("filename")):
+            continue
+
+        if strict and await _is_genuine_application(cid):
+            continue
+
+        record = {
+            "shell_candidate_id": cid,
+            "shell_name": _name_of(cand) or "(no name)",
+            "shell_pipeline_id": entry.get("id"),
+            "shell_status_id": entry.get("status_id"),
+            "cover_attachment_id": cover.get("id"),
+            "cover_filename": cover.get("filename"),
+            "shell_date_created": cand.get("date_created"),
+            "shell_source": cand.get("source"),
+        }
+
+        match = await _find_sibling_parent(cover.get("id"), cid, pipeline_index)
+        if not match:
+            match = _find_name_parent(cover.get("filename"), cid, pipeline_index)
+
+        if match:
+            record.update(match)
+            shells.append(record)
+        else:
+            record.update({
+                "parent_candidate_id": None,
+                "match_confidence": "none",
+                "match_reason": "no sibling resume and no name match on this pipeline",
+            })
+            unmatched.append(record)
+
+    return {
+        "job_id": job_id,
+        "pipeline_total": total,
+        "pipeline_returned": len(entries),
+        "no_email_suspects": len(suspects),
+        "suspects_checked": checked,
+        "shells_matched": shells,
+        "shells_unmatched": unmatched,
+        "strict_activity_check": strict,
+        "capped": (len(shells) + len(unmatched)) >= max_shells,
+    }
+
+
+async def tool_find_orphan_shells(args: dict):
+    """READ-ONLY. Find SEEK cover-letter shell records on a job's pipeline and
+    say which real candidate each one belongs to. Changes nothing.
+
+    Run this before screening a pipeline. Every shell it finds is a phantom row
+    that would otherwise consume a reader agent, inflate the applicant count you
+    quote the client, and — because shells have no email address — silently take
+    no action in a role closedown."""
+    job_id = args["job_id"]
+    result = await _scan_orphan_shells(
+        job_id,
+        strict=bool(args.get("strict", True)),
+        max_shells=args.get("max_shells", 60),
+    )
+    matched = result["shells_matched"]
+    unmatched = result["shells_unmatched"]
+    result["summary"] = (
+        f"{len(matched)} shell(s) matched to a real candidate, "
+        f"{len(unmatched)} shell(s) found with no parent identified, "
+        f"out of {result['pipeline_returned']} pipeline records "
+        f"({result['no_email_suspects']} had no email and were checked properly)."
+    )
+    result["next_step"] = (
+        "Nothing has changed. To act on these, call merge_orphan_shells with the "
+        "same job_id — it previews by default and needs confirm: true to write."
+    )
+    return result
+
+
+async def tool_merge_orphan_shells(args: dict):
+    """Move each shell's cover letter onto the real candidate it belongs to,
+    then dispose of the empty shell. PREVIEW BY DEFAULT.
+
+    This is what the CATS UI would call a merge. There is no merge endpoint in
+    the CATS v3 API, and none is needed: the shell holds nothing but the cover
+    letter, so copying that file across and clearing the shell is the whole job.
+
+    The cover letter is kept, not binned. Several observed letters carried real
+    screening evidence that was being thrown away — one named the candidate's
+    current role and location, neither of which was on his resume.
+
+    disposition:
+      'park'   (DEFAULT) — move the shell to the CV Unreadable status and leave
+                the record in place. Reversible.
+      'delete' — DELETE /candidates/{id}. PERMANENT. Requires allow_delete: true
+                as well as confirm: true, deliberately: two separate locks on
+                the only irreversible action in this tool.
+      'attachment_only' — copy the cover letter across and leave the shell
+                exactly as it is. Use for a first cautious run.
+
+    A shell is never touched unless a parent was identified. Unmatched shells
+    are reported and left alone.
+    """
+    job_id = args.get("job_id")
+    disposition = (args.get("disposition") or "park").strip().lower()
+    min_confidence = (args.get("min_confidence") or "high").strip().lower()
+
+    if disposition not in ("park", "delete", "attachment_only"):
+        return {"error": "disposition must be 'park', 'delete' or 'attachment_only'."}
+
+    scan = await _scan_orphan_shells(
+        job_id,
+        strict=bool(args.get("strict", True)),
+        max_shells=args.get("max_shells", 60),
+    )
+
+    candidates_to_act = scan["shells_matched"]
+    if min_confidence == "high":
+        deferred = [s for s in candidates_to_act if s.get("match_confidence") != "high"]
+        candidates_to_act = [s for s in candidates_to_act if s.get("match_confidence") == "high"]
+    else:
+        deferred = []
+
+    # Explicit id list overrides the scan, but only ever narrows it — a shell
+    # still has to have passed the scan to be acted on. Nothing here can be
+    # pointed at an arbitrary candidate record.
+    only_ids = args.get("shell_candidate_ids")
+    if only_ids:
+        wanted = set(only_ids)
+        candidates_to_act = [s for s in candidates_to_act if s["shell_candidate_id"] in wanted]
+
+    if not args.get("confirm"):
+        return {
+            "preview": True,
+            "action": "merge_orphan_shells",
+            "job_id": job_id,
+            "disposition": disposition,
+            "would_merge": [
+                {
+                    "shell": f"{s['shell_name']} (id {s['shell_candidate_id']})",
+                    "cover_letter": s["cover_filename"],
+                    "onto": f"{s.get('parent_name')} (id {s.get('parent_candidate_id')})",
+                    "confidence": s.get("match_confidence"),
+                    "why": s.get("match_reason"),
+                }
+                for s in candidates_to_act
+            ],
+            "deferred_lower_confidence": [
+                {
+                    "shell": f"{s['shell_name']} (id {s['shell_candidate_id']})",
+                    "proposed_parent": f"{s.get('parent_name')} (id {s.get('parent_candidate_id')})",
+                    "confidence": s.get("match_confidence"),
+                    "why": s.get("match_reason"),
+                }
+                for s in deferred
+            ],
+            "unmatched_left_alone": scan["shells_unmatched"],
+            "counts": {
+                "pipeline_records": scan["pipeline_returned"],
+                "would_merge": len(candidates_to_act),
+                "deferred": len(deferred),
+                "unmatched": len(scan["shells_unmatched"]),
+            },
+            "note": (
+                "Nothing has changed yet. Check the pairings above — particularly any "
+                "shell whose name looks nothing like its proposed parent, which is "
+                "normal (CATS misparses names out of cover-letter prose) but worth a "
+                "glance. Call again with confirm: true to apply. "
+                + ("Deleting also requires allow_delete: true." if disposition == "delete" else "")
+            ),
+        }
+
+    if disposition == "delete" and not args.get("allow_delete"):
+        return {
+            "error": "disposition 'delete' also requires allow_delete: true. "
+                     "DELETE /candidates/{id} is permanent and cannot be undone. "
+                     "Use disposition 'park' unless you specifically want the "
+                     "records gone.",
+        }
+
+    results = []
+    for s in candidates_to_act:
+        outcome = {
+            "shell_candidate_id": s["shell_candidate_id"],
+            "shell_name": s["shell_name"],
+            "parent_candidate_id": s["parent_candidate_id"],
+            "attachment_copied": False,
+            "activity_logged": False,
+            "shell_disposition": "none",
+        }
+
+        # 1. Copy the cover letter onto the real record.
+        try:
+            content, _ = await cats_get_binary(
+                f"/attachments/{s['cover_attachment_id']}/download"
+            )
+            await cats_post_multipart(
+                f"/candidates/{s['parent_candidate_id']}/attachments",
+                s["cover_filename"],
+                content,
+                {"is_resume": "false"},
+            )
+            outcome["attachment_copied"] = True
+        except HTTPException as e:
+            outcome["error"] = f"copy failed: {str(e.detail)[:300]}"
+            results.append(outcome)
+            continue  # never dispose of a shell whose file did not make it across
+
+        # 2. Leave an audit trail on the real record.
+        try:
+            await cats_post(
+                f"/candidates/{s['parent_candidate_id']}/activities",
+                {
+                    "type": "other",
+                    "notes": (
+                        f"Cover letter '{s['cover_filename']}' moved here from "
+                        f"duplicate shell record {s['shell_candidate_id']} "
+                        f"(\"{s['shell_name']}\"), created by the CATS resume inbox "
+                        f"splitting one SEEK application across two candidate records. "
+                        f"Match: {s.get('match_reason')}."
+                    ),
+                },
+            )
+            outcome["activity_logged"] = True
+        except HTTPException as e:
+            outcome["activity_error"] = str(e.detail)[:200]
+
+        # 3. Dispose of the shell.
+        if disposition == "attachment_only":
+            outcome["shell_disposition"] = "left in place"
+        elif disposition == "park":
+            try:
+                await cats_post(
+                    f"/pipelines/{s['shell_pipeline_id']}/status",
+                    {"status_id": SHELL_PARK_STATUS_ID},
+                )
+                outcome["shell_disposition"] = f"parked at status {SHELL_PARK_STATUS_ID}"
+            except HTTPException as e:
+                outcome["shell_disposition"] = f"park failed: {str(e.detail)[:200]}"
+        elif disposition == "delete":
+            try:
+                await cats_delete(f"/candidates/{s['shell_candidate_id']}")
+                outcome["shell_disposition"] = "deleted"
+            except HTTPException as e:
+                outcome["shell_disposition"] = f"delete failed: {str(e.detail)[:200]}"
+
+        results.append(outcome)
+
+    return {
+        "changed": True,
+        "action": "merge_orphan_shells",
+        "job_id": job_id,
+        "disposition": disposition,
+        "merged": len([r for r in results if r["attachment_copied"]]),
+        "failed": len([r for r in results if not r["attachment_copied"]]),
+        "deferred_lower_confidence": len(deferred),
+        "unmatched_left_alone": len(scan["shells_unmatched"]),
+        "results": results,
+    }
+
 TOOLS = {
     # ---- v3.4: Adobe PDF conversion (async, two-call pattern) ----
     "convert_attachment": {
@@ -2850,6 +3427,37 @@ TOOLS = {
             "required": ["tag"],
         },
         "handler": tool_add_candidate_tag,
+    },
+    "find_orphan_shells": {
+        "description": "READ-ONLY. Find SEEK cover-letter 'shell' records on a job's pipeline and identify which real candidate each belongs to. CATS's resume inbox treats every attachment on an inbound application as its own candidate, so each SEEK cover letter creates a second, empty record - sometimes 'Anonymous Candidate', sometimes a duplicate under the person's real name, sometimes filed under a wrong name parsed out of the letter's prose. All three are the same bug. Run this BEFORE screening a pipeline: shells waste a reader per row, inflate the applicant count, and have no email address so they silently take no action in a role closedown. Changes nothing - use merge_orphan_shells to act.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "integer", "description": "The job whose pipeline to scan."},
+                "strict": {"type": "boolean", "default": True, "description": "Apply the definitive test: a genuine application always carries an 'Application for the role of X' activity, a shell never does. Costs one extra call per suspect. Leave true unless you are only eyeballing."},
+                "max_shells": {"type": "integer", "default": 60, "description": "Stop after this many findings, to stay inside the CATS 500-requests/hour limit."},
+            },
+            "required": ["job_id"],
+        },
+        "handler": tool_find_orphan_shells,
+    },
+    "merge_orphan_shells": {
+        "description": "Move each SEEK cover-letter shell's attachment onto the real candidate it belongs to, then dispose of the empty shell. This is the merge CATS itself has no endpoint for - and it is safer than a true merge, because the shell holds nothing except that one cover letter. The letter is KEPT, not binned: several carry real screening evidence missing from the resume. PREVIEW BY DEFAULT - call without confirm to see every proposed pairing and why. disposition 'park' (default, reversible) moves the shell to CV Unreadable; 'delete' is permanent and needs allow_delete: true as a second lock; 'attachment_only' copies the file and leaves the shell untouched. Shells with no identified parent are reported and never touched.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "integer", "description": "The job whose pipeline to clean."},
+                "disposition": {"type": "string", "enum": ["park", "delete", "attachment_only"], "default": "park", "description": "What to do with the shell once its cover letter is safely on the real record."},
+                "min_confidence": {"type": "string", "enum": ["high", "any"], "default": "high", "description": "'high' acts only on shells matched by the sibling-attachment test (the resume that arrived in the same email). 'any' also includes filename-name matches - review those in the preview first."},
+                "shell_candidate_ids": {"type": "array", "items": {"type": "integer"}, "description": "Optional. Narrow the run to these shells only. Can only narrow the scan's findings, never point the tool at an arbitrary record."},
+                "strict": {"type": "boolean", "default": True},
+                "max_shells": {"type": "integer", "default": 60},
+                "confirm": {"type": "boolean", "default": False},
+                "allow_delete": {"type": "boolean", "default": False, "description": "Second lock, required only for disposition 'delete'."},
+            },
+            "required": ["job_id"],
+        },
+        "handler": tool_merge_orphan_shells,
     },
 }
 

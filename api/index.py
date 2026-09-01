@@ -49,6 +49,13 @@ v3 (July 2026) changes — all verified against the live CATS v3 docs:
     This also unblocks never-employ/do-not-contact flag detection: every
     pipeline at a given status_id can now be pulled in one hit.
 
+v3.5.3 (1 September 2026) — parked shells excluded from the scan:
+  - _scan_orphan_shells now skips any pipeline row already sitting at
+    SHELL_PARK_STATUS_ID. Without this the scan keeps returning shells that
+    have already been merged, and because merge_orphan_shells copies the cover
+    letter unconditionally, every scheduled sweep copied the same letters onto
+    the same real candidates again. Caught before it ran twice.
+
 v3.5.2 (1 September 2026) — shell parking and status-change cleanup:
   - SHELL_PARK_STATUS_ID moved from CV Unreadable (6453057) to the new
     Duplicate Record status (6455017). CV Unreadable was doing three jobs at
@@ -2559,9 +2566,17 @@ async def _scan_orphan_shells(job_id: int, strict: bool = True,
 
     # Cheap pre-filter: no email address at all. Costs nothing extra because
     # the pipeline call already embedded it.
+    # v3.5.3: a shell already parked at Duplicate Record has been dealt with.
+    # It must NOT come back in the scan. merge_orphan_shells copies the cover
+    # letter unconditionally, so a parked shell that keeps being found gets its
+    # letter copied onto the parent again on every sweep — hourly, forever,
+    # accumulating duplicate attachments on real candidates. Observed 1 Sep 2026:
+    # 7 parked shells still being returned by the scan.
     suspects = [
         (entry, cand) for entry, cand in entries
-        if cand.get("id") and not _has_email(cand)
+        if cand.get("id")
+        and not _has_email(cand)
+        and entry.get("status_id") != SHELL_PARK_STATUS_ID
     ]
 
     shells = []
@@ -2672,8 +2687,9 @@ async def tool_merge_orphan_shells(args: dict):
     current role and location, neither of which was on his resume.
 
     disposition:
-      'park'   (DEFAULT) — move the shell to the CV Unreadable status and leave
-                the record in place. Reversible.
+      'park'   (DEFAULT) — move the shell to the Duplicate Record status and
+                leave the record in place. Reversible. Parked shells are
+                excluded from later scans so they are never re-merged.
       'delete' — DELETE /candidates/{id}. PERMANENT. Requires allow_delete: true
                 as well as confirm: true, deliberately: two separate locks on
                 the only irreversible action in this tool.

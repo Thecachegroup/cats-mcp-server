@@ -49,6 +49,15 @@ v3 (July 2026) changes — all verified against the live CATS v3 docs:
     This also unblocks never-employ/do-not-contact flag detection: every
     pipeline at a given status_id can now be pulled in one hit.
 
+v3.5.2 (1 September 2026) — shell parking and status-change cleanup:
+  - SHELL_PARK_STATUS_ID moved from CV Unreadable (6453057) to the new
+    Duplicate Record status (6455017). CV Unreadable was doing three jobs at
+    once — parked shells, unreadable files, and applications that arrived with
+    no CV — which made every count derived from it wrong. Measured on the
+    round-4 Azure pipeline: 8 rows at CV Unreadable, 7 of them shells.
+  - change_pipeline_status is no longer marked untested. POST
+    /pipelines/{id}/status is confirmed correct (7 live calls, 1 Sep 2026).
+
 v3.5.1 (1 September 2026) — attachment upload fixed:
   - CATS rejects multipart/form-data on /attachments and /resumes with
     {"message":"Unsupported Content-Type."}. It wants a raw binary body and
@@ -1371,9 +1380,7 @@ async def tool_change_pipeline_status(args: dict):
             "action": "change_pipeline_status",
             "pipeline_id": pipeline_id,
             "would_set_status_id_to": status_id,
-            "note": "This endpoint is inferred from CATS's consistent status-change pattern and hasn't been "
-                    "live-tested yet — if it fails, the exact endpoint may need a small fix. Nothing has changed "
-                    "yet either way. Call this again with confirm: true to actually attempt the change in CATS.",
+            "note": "Nothing has changed yet. Call this again with confirm: true to apply.",
         }
 
     result = await cats_post(f"/pipelines/{pipeline_id}/status", {"status_id": status_id})
@@ -2349,7 +2356,9 @@ _SIBLING_WINDOW = 3
 # Pipeline status used to park a shell rather than delete it. This is TCG's
 # existing "CV Unreadable" status and is the DEFAULT disposition, because
 # parking is reversible and DELETE /candidates/{id} is not.
-SHELL_PARK_STATUS_ID = 6455017   # Duplicate Record
+SHELL_PARK_STATUS_ID = 6455017  # Duplicate Record. NOT CV Unreadable —
+# that status means a person whose file would not open, and mixing shells
+# into it corrupts every applicant count that touches it.
 
 
 def _looks_like_cover_letter(filename: str) -> bool:
@@ -3241,7 +3250,7 @@ TOOLS = {
         "handler": tool_add_candidate_to_pipeline,
     },
     "change_pipeline_status": {
-        "description": "Move a candidate to a different pipeline stage/status in CATS (e.g. from 'Qualifying' to 'TCG Interview'). PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually change it. Use get_workflow_statuses first to find the right status_id. Endpoint is inferred from CATS's pattern and not yet live-tested — report back if it errors.",
+        "description": "Move a candidate to a different pipeline stage/status in CATS (e.g. from 'Qualifying' to 'TCG Interview'). PREVIEW BY DEFAULT: call without confirm first. Call again with confirm: true to actually change it. Use get_workflow_statuses first to find the right status_id. Live-tested 1 Sep 2026 — POST /pipelines/{id}/status is correct.",
         "inputSchema": {
             "type": "object",
             "properties": {

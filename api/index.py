@@ -49,6 +49,16 @@ v3 (July 2026) changes — all verified against the live CATS v3 docs:
     This also unblocks never-employ/do-not-contact flag detection: every
     pipeline at a given status_id can now be pulled in one hit.
 
+v3.5.1 (1 September 2026) — attachment upload fixed:
+  - CATS rejects multipart/form-data on /attachments and /resumes with
+    {"message":"Unsupported Content-Type."}. It wants a raw binary body and
+    the filename as a query parameter. cats_post_multipart is replaced by
+    cats_post_binary. This unblocks merge_orphan_shells (which had never
+    completed a single row) and fixes upload_candidate_attachment, which was
+    broken the same way through the same helper.
+  - is_resume now selects the endpoint (/resumes vs /attachments) instead of
+    being sent as a form field CATS never read.
+
 v3.5 (August 2026) — SEEK cover-letter shell detection and merge:
   - find_orphan_shells (read-only) and merge_orphan_shells (preview-gated).
     CATS's resume inbox documents that "Each attachment found will be parsed
@@ -227,17 +237,44 @@ async def cats_delete(path: str, body: dict | None = None):
             return {"deleted": True}
 
 
-async def cats_post_multipart(path: str, filename: str, content: bytes, extra: dict | None = None):
-    headers = {"Authorization": f"Token {CATS_API_KEY}"}
-    files = {"file": (filename, content)}
+async def cats_post_binary(path: str, filename: str, content: bytes):
+    """v3.5.1: upload a file to CATS.
+
+    CATS does NOT accept multipart/form-data on the attachment endpoints. The
+    documented form is a RAW BINARY body with the filename as a query
+    parameter:
+
+        POST /candidates/{id}/attachments?filename=<name>
+        Content-Type: application/octet-stream
+        <raw bytes>
+
+    Sending multipart returns HTTP 4xx {"message":"Unsupported Content-Type."}
+    for every file regardless of its extension. That is what broke
+    merge_orphan_shells on its first live run (31 Aug 2026, 10 of 10 rows
+    failed at the copy step) and it broke upload_candidate_attachment the same
+    way — both went through the old multipart helper.
+
+    is_resume is NOT a form field. It is chosen by endpoint: /attachments for
+    an ordinary file, /resumes for one that should appear in resume history.
+    Callers pass the endpoint they want in `path`.
+    """
+    headers = {
+        "Authorization": f"Token {CATS_API_KEY}",
+        "Content-Type": "application/octet-stream",
+    }
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(f"{CATS_API_BASE}{path}", headers=headers, files=files, data=extra or {})
+        resp = await client.post(
+            f"{CATS_API_BASE}{path}",
+            headers=headers,
+            params={"filename": filename},
+            content=content,
+        )
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
         try:
             return resp.json()
         except Exception:
-            return {"uploaded": True}
+            return {"uploaded": True, "location": resp.headers.get("location")}
 
 
 # ---------------------------------------------------------------------------
@@ -2042,9 +2079,10 @@ async def tool_upload_candidate_attachment(args: dict):
             "note": "Nothing has changed yet. Call again with confirm: true to upload.",
         }
     content = base64.b64decode(args["content_base64"])
-    result = await cats_post_multipart(
-        f"/candidates/{candidate_id}/attachments", filename, content,
-        {"is_resume": "true" if is_resume else "false"},
+    # v3.5.1: is_resume selects the endpoint; it is not a form field.
+    endpoint = "resumes" if is_resume else "attachments"
+    result = await cats_post_binary(
+        f"/candidates/{candidate_id}/{endpoint}", filename, content,
     )
     return {"changed": True, "action": "upload_candidate_attachment", "candidate_id": candidate_id, "result": result}
 
@@ -2729,11 +2767,10 @@ async def tool_merge_orphan_shells(args: dict):
             content, _ = await cats_get_binary(
                 f"/attachments/{s['cover_attachment_id']}/download"
             )
-            await cats_post_multipart(
+            await cats_post_binary(
                 f"/candidates/{s['parent_candidate_id']}/attachments",
                 s["cover_filename"],
                 content,
-                {"is_resume": "false"},
             )
             outcome["attachment_copied"] = True
         except HTTPException as e:

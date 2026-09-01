@@ -2349,7 +2349,7 @@ _SIBLING_WINDOW = 3
 # Pipeline status used to park a shell rather than delete it. This is TCG's
 # existing "CV Unreadable" status and is the DEFAULT disposition, because
 # parking is reversible and DELETE /candidates/{id} is not.
-SHELL_PARK_STATUS_ID = 6453057
+SHELL_PARK_STATUS_ID = 6455017   # Duplicate Record
 
 
 def _looks_like_cover_letter(filename: str) -> bool:
